@@ -197,7 +197,7 @@ def compute_and_select(
     # 确定候选节点范围
     if prev_selected_parent_indices is None:
         # 顶层：考虑所有不包含未来信息的节点
-        candidates_mask = node_ranges[:, 1] <= query_pos
+        candidates_mask = node_ranges[:, 1] <= query_pos + 1 # 左闭右开所以 +1
     else:
         # 非顶层：只考虑上一层选中节点的子节点
         parents = prev_selected_parent_indices.reshape(-1)  # [B*M]
@@ -206,14 +206,14 @@ def compute_and_select(
         children = children[children < N]
         
         # 过滤未来信息
-        valid_mask = node_ranges[:, 1] <= query_pos
+        valid_mask = node_ranges[:, 1] <= query_pos + 1  # 左闭右开所以 +1
         valid_children = children[valid_mask[children]]
         
         candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
         candidates_mask[valid_children] = True
     
     # 最右侧节点（保留，即使可能包含未来信息）
-    rightmost_idx = (query_pos - 1) // (compression_rate ** layer_idx)
+    rightmost_idx = query_pos // (compression_rate ** layer_idx)
     candidates_mask[rightmost_idx] = True
     
     # 提取候选节点
@@ -222,9 +222,7 @@ def compute_and_select(
     
     if num_candidates == 0:
         # 无候选节点
-        return (torch.zeros(B, 0, dtype=torch.long, device=device),
-                torch.zeros(B, 0, H, D, device=device, dtype=layer_k.dtype),
-                torch.zeros(B, 0, H, D, device=device, dtype=layer_v.dtype))
+        raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
     
     candidate_k = layer_k[:, candidates_mask]  # [B, num_cand, H, D]
     candidate_v = layer_v[:, candidates_mask]  # [B, num_cand, H, D]
@@ -469,9 +467,9 @@ def forward_kernel(
     # 2. compute and select for each query position
     output = torch.zeros_like(q)
     if query_positions is None:
-        positions_to_compute = range(1, T)
+        positions_to_compute = range(0, T)  # TODO: 从位置 0 开始?
     else:
-        positions_to_compute = [p for p in query_positions.tolist() if p > 0]
+        positions_to_compute = [p for p in query_positions.tolist() if p >= 0]
     
     for b in range(B):
         for t in positions_to_compute:
