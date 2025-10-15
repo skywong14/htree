@@ -234,7 +234,7 @@ def compute_and_select(
     
     query_pos_rope = torch.tensor([num_candidates], device=device)
     cos_q, sin_q = rotary.forward(query_pos_rope, device)
-    query_rope = apply_rotary_emb(query, cos_q[None, None, :], sin_q[None, None, :])  # [B, H, D]
+    query_rope = apply_rotary_emb(query, cos_q[0], sin_q[0])  # cos_q[0]: [dim//2]
     
     # 计算注意力分数
     scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [B, H, num_cand]
@@ -371,7 +371,7 @@ def final_compute(
         
         # 应用 RoPE 到 query（num_final）
         cos_q, sin_q = rotary.forward(torch.tensor([num_final], device=device), device)
-        query_rope = apply_rotary_emb(query[b], cos_q[None, :], sin_q[None, :])  # [H, D]
+        query_rope = apply_rotary_emb(query[b], cos_q[0], sin_q[0])  # [H, D]
         
         # ========== parallel：各层独立计算在线注意力统计量 ==========
         
@@ -447,7 +447,9 @@ def forward_kernel(
         q: [B, T, H, D]
         k: [B, T, H, D]
         v: [B, T, H, D]
-        query_positions: [B, T] or None(each position to be computed)
+        query_positions: [B, num_positions] or None
+            If None, compute attention for all positions.
+            If provided, only compute attention for specified positions per batch.
         compression_rate: compression rate, 16
         max_top_nodes: maximum number of top nodes, 8192
         top_k_per_layer: number of selected nodes per layer, 512
@@ -466,12 +468,18 @@ def forward_kernel(
     
     # 2. compute and select for each query position
     output = torch.zeros_like(q)
-    if query_positions is None:
-        positions_to_compute = range(0, T)  # TODO: 从位置 0 开始?
-    else:
-        positions_to_compute = [p for p in query_positions.tolist() if p >= 0]
     
     for b in range(B):
+        # Determine positions to compute for this batch element
+        if query_positions is None:
+            positions_to_compute = range(0, T)
+        else:
+            # query_positions is [B, num_positions]
+            batch_positions = query_positions[b].tolist()
+            if isinstance(batch_positions, int):
+                batch_positions = [batch_positions]
+            positions_to_compute = [p for p in batch_positions if p >= 0]
+        
         for t in positions_to_compute:
             
             current_query = q[b:b+1, t]  # [1, H, D]
