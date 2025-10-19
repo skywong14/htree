@@ -21,7 +21,6 @@ class Rotary(torch.nn.Module):
         self.cache_size = cache_size
         
         # 预计算 RoPE 值，额外留出 1024 个位置以处理边界情况
-        # (如 query_pos = cache_size 的情况)
         extended_size = cache_size + 1024
         positions = torch.arange(extended_size, dtype=torch.float32)
         freqs = torch.outer(positions, self.inv_freq)
@@ -50,7 +49,6 @@ class Rotary(torch.nn.Module):
                     f"[0, {len(self._cos_cache)}). Consider increasing cache_size."
                 )
         
-        # 直接索引预计算的 cache（零开销）
         return self._cos_cache[positions], self._sin_cache[positions]
 
 def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -145,7 +143,55 @@ def build_tree(
     return layers
 
 
-def compute_and_select(
+def online_softmax_merge(
+    max_score: torch.Tensor,
+    sum_exp: torch.Tensor,
+    weighted_output: torch.Tensor,
+    new_scores: torch.Tensor,
+    new_values: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Merge new scores and values into existing softmax accumulation state using online algorithm.
+    
+    Args:
+        max_score: [1] Current maximum score
+        sum_exp: [1] Current sum of exponentials
+        weighted_output: [1, H, D] Current weighted output
+        new_scores: [1, num_new] New attention scores to merge
+        new_values: [1, num_new, H, D] New values to merge
+    
+    Returns:
+        Updated (max_score, sum_exp, weighted_output)
+    """
+    if new_scores.numel() == 0:
+        return max_score, sum_exp, weighted_output
+    
+    # Flatten batch dimension (always 1 in our case)
+    new_scores = new_scores.squeeze(0)  # [num_new]
+    new_values = new_values.squeeze(0)  # [num_new, H, D]
+    
+    # Compute new max
+    new_max = new_scores.max()
+    old_max = max_score.item()
+    updated_max = max(old_max, new_max.item())
+    
+    # Rescale existing accumulation if max changed
+    if old_max > -float('inf'):
+        scale_old = torch.exp(torch.tensor(old_max - updated_max, device=max_score.device))
+        sum_exp = sum_exp * scale_old
+        weighted_output = weighted_output * scale_old
+    
+    # Add new contributions
+    exp_new = torch.exp(new_scores - updated_max)  # [num_new]
+    sum_exp = sum_exp + exp_new.sum()
+    weighted_output = weighted_output + torch.einsum('n,nhd->hd', exp_new, new_values).unsqueeze(0)
+    
+    max_score = torch.tensor([updated_max], device=max_score.device)
+    
+    return max_score, sum_exp, weighted_output
+
+
+def compute_select_and_merge(
     layer_k: torch.Tensor,
     layer_v: torch.Tensor,
     node_ranges: torch.Tensor,
@@ -155,35 +201,35 @@ def compute_and_select(
     compression_rate: int,
     layer_idx: int,
     rotary: Rotary,
+    max_score: torch.Tensor,
+    sum_exp: torch.Tensor,
+    weighted_output: torch.Tensor,
     top_k: int = 512,
     scale: Optional[float] = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
-    compute and select Top-K nodes in the current layer
-    
-    Simplified strategy: instead of treating rightmost node separately,
-    we give it a large score bonus to ensure it's always selected.
+    Compute attention scores, select Top-K nodes, and merge non-selected nodes into softmax state.
     
     Args:
-        layer_k, layer_v: [B, N, H, D]
+        layer_k, layer_v: [B, N, H, D] (B=1 in practice)
         node_ranges: [N, 2] Each node covers the token range [start, end)
-        query: [B, H, D]
+        query: [B, H, D] (B=1 in practice)
         query_pos: query position m
-        prev_selected_parent_indices: [B, num_selected] or None(top layer)
+        prev_selected_parent_indices: [B, num_selected] or None (top layer)
         compression_rate: compression rate
         layer_idx: current layer index (0: bottom layer)
-        rotary: Rotary
+        rotary: Rotary embedding
+        max_score: [1] Current maximum score in softmax accumulation
+        sum_exp: [1] Current sum of exponentials
+        weighted_output: [1, H, D] Current weighted output
         top_k: number of selected nodes, 512
         scale: attention scale
     
     Returns:
-        candidate_indices: [num_cand] all candidate node indices
-        candidate_k: [B, num_cand, H, D] all candidate keys
-        candidate_v: [B, num_cand, H, D] all candidate values
-        candidate_scores: [B, num_cand] attention scores for all candidates
-        selected_indices: [B, top_k] selected node indices (for next layer expansion)
-        selected_k: [B, num_selected, H, D] selected keys
-        selected_v: [B, num_selected, H, D] selected values
+        max_score: [1] Updated maximum score
+        sum_exp: [1] Updated sum of exponentials
+        weighted_output: [1, H, D] Updated weighted output
+        selected_indices: [B, top_k] Selected node indices for next layer (None for bottom layer)
     """
     B, N, H, D = layer_k.shape
     device = layer_k.device
@@ -210,7 +256,6 @@ def compute_and_select(
         candidates_mask[valid_children] = True
     
     # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
-    # 包含 query_pos 的节点索引
     rightmost_idx = query_pos // (compression_rate ** layer_idx)
     if rightmost_idx < N:
         candidates_mask[rightmost_idx] = True
@@ -221,19 +266,16 @@ def compute_and_select(
     num_candidates = candidate_indices.numel()
     
     if num_candidates == 0:
-        # 无候选节点
         raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
     
     candidate_k = layer_k[:, candidates_mask]  # [B, num_cand, H, D]
     candidate_v = layer_v[:, candidates_mask]  # [B, num_cand, H, D]
     
-    # 应用 RoPE（优化：直接使用预计算的 cache，避免创建新 tensor）
-    # 候选节点使用位置 0, 1, 2, ..., num_candidates-1
+    # 应用 RoPE
     cos = rotary._cos_cache[:num_candidates]
     sin = rotary._sin_cache[:num_candidates]
     candidate_k_rope = apply_rotary_emb(candidate_k, cos[None, :, None, :], sin[None, :, None, :])
     
-    # Query 使用位置 num_candidates
     cos_q = rotary._cos_cache[num_candidates]
     sin_q = rotary._sin_cache[num_candidates]
     query_rope = apply_rotary_emb(query, cos_q, sin_q)
@@ -242,103 +284,44 @@ def compute_and_select(
     scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [B, H, num_cand]
     scores_pooled = scores.mean(dim=1)  # [B, num_cand]
     
-    # 给包含 query 位置的最右侧节点加分数加成（确保一定被选中）
-    # 注意：仅在非最底层加分数加成，因为最底层不需要向下拓展
-    if layer_idx > 0:
+    # 给最右侧节点加分数加成（仅非底层）
+    is_bottom_layer = (layer_idx == 0)
+    if not is_bottom_layer:
         rightmost_local_idx = (candidate_indices == rightmost_idx).nonzero(as_tuple=True)[0]
         if rightmost_local_idx.numel() > 0:
             scores_pooled[:, rightmost_local_idx] += 1e9
     
-    # Top-K
-    actual_top_k = min(top_k, num_candidates)
-    _, topk_idx = torch.topk(scores_pooled, actual_top_k, dim=1)  # [B, actual_top_k]
+    # 确定参与在线Softmax的节点和选中的节点
+    if is_bottom_layer:
+        # 底层：所有候选节点参与计算
+        merge_scores = scores_pooled
+        merge_values = candidate_v
+        selected_indices = None
+    else:
+        # 非底层：选择Top-K，其余参与计算
+        actual_top_k = min(top_k, num_candidates)
+        _, topk_local_idx = torch.topk(scores_pooled, actual_top_k, dim=1)  # [B, actual_top_k]
+        
+        # 被选中的节点掩码
+        selected_mask = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+        selected_mask[topk_local_idx.squeeze(0)] = True
+        
+        # 未被选中的节点，参与计算
+        merge_mask = ~selected_mask
+        merge_scores = scores_pooled[:, merge_mask]  # [B, num_merge]
+        merge_values = candidate_v[:, merge_mask]  # [B, num_merge, H, D]
+        
+        # 选中的节点索引
+        selected_indices = candidate_indices[topk_local_idx.squeeze(0)].unsqueeze(0)  # [B, actual_top_k]
     
-    selected_k = torch.gather(
-        candidate_k, 1,
-        topk_idx[:, :, None, None].expand(-1, -1, H, D)
-    )  # [B, actual_top_k, H, D]
-    selected_v = torch.gather(
-        candidate_v, 1,
-        topk_idx[:, :, None, None].expand(-1, -1, H, D)
-    )  # [B, actual_top_k, H, D]
-    selected_indices = torch.gather(
-        candidate_indices[None, :].expand(B, -1), 1, topk_idx
-    )  # [B, actual_top_k]
+    # Online softmax merge
+    max_score, sum_exp, weighted_output = online_softmax_merge(
+        max_score, sum_exp, weighted_output, merge_scores, merge_values
+    )
     
-    # 返回所有候选节点信息 + 选中的节点信息
-    return candidate_indices, candidate_k, candidate_v, scores_pooled, selected_indices, selected_k, selected_v
+    return max_score, sum_exp, weighted_output, selected_indices
 
 
-def final_compute(
-    all_layer_info: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
-    query: torch.Tensor
-) -> torch.Tensor:
-    """
-    compute final attention output
-    
-    Directly reuse attention scores computed in compute_and_select.
-    Collect participating nodes from each layer and perform softmax over their scores.
-    
-    Args:
-        all_layer_info: list of layer information
-            each element is (candidate_indices, candidate_v, candidate_scores, selected_indices), shape:
-            - candidate_indices: [num_candidates] all candidate node indices
-            - candidate_v: [B, num_candidates, H, D] all candidate values
-            - candidate_scores: [B, num_candidates] attention scores
-            - selected_indices: [B, num_selected] selected node indices (for filtering)
-        query: [B, H, D]
-    
-    Returns:
-        output: [B, H, D] attention output
-    """
-    B, H, D = query.shape
-    device = query.device
-    num_layers = len(all_layer_info)
-    output = torch.zeros(B, H, D, device=device, dtype=query.dtype)
-    
-    # Process each batch element
-    for b in range(B):
-        # Collect participating nodes from each layer
-        all_scores = []
-        all_values = []
-        
-        for layer_idx, (candidate_indices, candidate_v, candidate_scores, selected_indices) in enumerate(all_layer_info):
-            # Determine participating nodes
-            is_bottom_layer = (layer_idx == num_layers - 1)
-            
-            if is_bottom_layer:
-                # Bottom layer: all candidates participate
-                participating_mask = torch.ones(len(candidate_indices), dtype=torch.bool, device=device)
-            else:
-                # Non-bottom layer: exclude selected nodes
-                is_selected = torch.isin(candidate_indices, selected_indices[b])
-                participating_mask = ~is_selected
-            
-            # Extract scores and values for participating nodes
-            if participating_mask.any():
-                scores = candidate_scores[b, participating_mask]  # [num_participating]
-                values = candidate_v[b, participating_mask]  # [num_participating, H, D]
-                
-                all_scores.append(scores)
-                all_values.append(values)
-        
-        if len(all_scores) == 0:
-            continue
-        
-        # Concatenate all scores and values
-        all_scores = torch.cat(all_scores, dim=0)  # [total_participating]
-        all_values = torch.cat(all_values, dim=0)  # [total_participating, H, D]
-        
-        # Compute softmax and weighted sum
-        # For numerical stability, subtract max score before exp
-        max_score = all_scores.max()
-        exp_scores = torch.exp(all_scores - max_score)  # [total_participating]
-        weights = exp_scores / exp_scores.sum()  # [total_participating]
-        
-        # Weighted sum: [total_participating] @ [total_participating, H, D] -> [H, D]
-        output[b] = torch.einsum('n,nhd->hd', weights, all_values)
-    
-    return output  # [B, H, D]
 
 
 def forward_kernel(
@@ -352,7 +335,8 @@ def forward_kernel(
     scale: Optional[float] = None
 ) -> torch.Tensor:
     """
-    forward kernel
+    forward kernel with online softmax algorithm
+    
     Args:
         q: [B, T, H, D]
         k: [B, T, H, D]
@@ -364,6 +348,7 @@ def forward_kernel(
         max_top_nodes: maximum number of top nodes, 8192
         top_k_per_layer: number of selected nodes per layer, 512
         scale: attention scale
+    
     Returns:
         output: [B, T, H, D]
     """
@@ -372,11 +357,11 @@ def forward_kernel(
         scale = D ** -0.5
     rotary = Rotary(dim=D)
     
-    # 1. build tree
+    # 1. Build tree
     layers = build_tree(k, v, compression_rate, max_top_nodes)
     num_layers = len(layers)
     
-    # 2. compute and select for each query position
+    # 2. Compute attention for each query position using online softmax
     output = torch.zeros_like(q)
     
     for b in range(B):
@@ -384,24 +369,26 @@ def forward_kernel(
         if query_positions is None:
             positions_to_compute = range(0, T)
         else:
-            # query_positions is [B, num_positions]
             batch_positions = query_positions[b].tolist()
             if isinstance(batch_positions, int):
                 batch_positions = [batch_positions]
             positions_to_compute = [p for p in batch_positions if p >= 0]
         
         for t in positions_to_compute:
-            
             current_query = q[b:b+1, t]  # [1, H, D]
             
-            # 3. compute and select
-            layer_info = []
+            # Initialize online softmax state
+            max_score = torch.tensor([-float('inf')], device=q.device)
+            sum_exp = torch.tensor([0.0], device=q.device)
+            weighted_output = torch.zeros(1, H, D, device=q.device, dtype=q.dtype)
+            
+            # 3. Iterate from top to bottom layer with online softmax merging
             prev_selected_indices = None
             
             for layer_idx in range(num_layers - 1, -1, -1):
                 layer_k, layer_v, node_ranges = layers[layer_idx]
                 
-                candidate_idx, candidate_k, candidate_v, candidate_scores, selected_idx, selected_k, selected_v = compute_and_select(
+                max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
                     layer_k[b:b+1],
                     layer_v[b:b+1],
                     node_ranges,
@@ -411,18 +398,16 @@ def forward_kernel(
                     compression_rate,
                     layer_idx,
                     rotary,
+                    max_score,
+                    sum_exp,
+                    weighted_output,
                     top_k_per_layer,
                     scale
                 )
                 
-                # record candidate and selected results
-                layer_info.append((candidate_idx, candidate_v, candidate_scores, selected_idx))
-                prev_selected_indices = selected_idx
+                prev_selected_indices = selected_indices
             
-            # 4. final_compute
-            output[b:b+1, t] = final_compute(
-                layer_info,
-                current_query
-            )
+            # 4. Normalize to get final output
+            output[b:b+1, t] = weighted_output / sum_exp.unsqueeze(-1)
     
     return output
