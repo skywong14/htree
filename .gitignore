@@ -1,4 +1,6 @@
 doc/
-unit_tests/
+unit_tests_naive/
+unit_tests_parallel/
 src/__pycache__/
 old_versions/
+reference_nsa/

@@ -4,6 +4,7 @@ Naive implementation of htree (Hierarchical Tree for KV Cache and Sparse Attenti
 
 from typing import List, Tuple, Optional
 import torch
+import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 
 
@@ -16,18 +17,14 @@ class Rotary(torch.nn.Module):
     
     def __init__(self, dim: int, base: float = 10000.0, cache_size: int = 8192):
         super().__init__()
-        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.dim = dim
         self.cache_size = cache_size
         
-        # 预计算 RoPE 值，额外留出 1024 个位置以处理边界情况
-        extended_size = cache_size + 1024
-        positions = torch.arange(extended_size, dtype=torch.float32)
-        freqs = torch.outer(positions, self.inv_freq)
-        
-        # 注册为 buffer，自动处理设备迁移
-        self.register_buffer('_cos_cache', freqs.cos(), persistent=False)
-        self.register_buffer('_sin_cache', freqs.sin(), persistent=False)
+        # 延迟创建缓存，在第一次调用时根据设备创建
+        self._cos_cache = None
+        self._sin_cache = None
+        self._cache_device = None
     
     def forward(self, positions: torch.Tensor, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -40,6 +37,16 @@ class Rotary(torch.nn.Module):
         Raises:
             ValueError: If any position exceeds the pre-computed cache range.
         """
+        # 延迟创建缓存，确保在正确的设备上
+        if self._cos_cache is None or self._cache_device != device:
+            extended_size = self.cache_size + 1024
+            positions_tensor = torch.arange(extended_size, dtype=torch.float32, device=device)
+            freqs = torch.outer(positions_tensor, self.inv_freq.to(device))
+            
+            self._cos_cache = freqs.cos()
+            self._sin_cache = freqs.sin()
+            self._cache_device = device
+        
         # 检查是否在预计算范围内
         if positions.numel() > 0:
             max_pos = positions.max().item()
@@ -77,18 +84,19 @@ def build_tree(
 ) -> List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Build hierarchical structure of htree.
-    
+
     Args:
         k: [B, T, H, D]
         v: [B, T, H, D]
         compression_rate: Compression rate, 16.
         max_top_nodes: Maximum number of top nodes, 8192.
-    
+
     Returns:
         layers: Hierarchical list, each element is (K_layer, V_layer, node_ranges)
             - K_layer, V_layer: [B, N_nodes, H, D]
             - node_ranges: [N_nodes, 2] Each node covers the token range [start, end)
     """
+    nvtx.range_push("BuildTree")
     B, T, H, D = k.shape
     layers = []
     
@@ -139,7 +147,8 @@ def build_tree(
         
         current_k, current_v = next_k, next_v
         current_len = next_len
-    
+
+    nvtx.range_pop()
     return layers
 
 
@@ -156,9 +165,9 @@ def online_softmax_merge(
     Args:
         max_score: [1] Current maximum score
         sum_exp: [1] Current sum of exponentials
-        weighted_output: [1, H, D] Current weighted output
+        weighted_output: [1, 1, D] Current weighted output (single head)
         new_scores: [1, num_new] New attention scores to merge
-        new_values: [1, num_new, H, D] New values to merge
+        new_values: [1, num_new, 1, D] New values to merge (single head)
     
     Returns:
         Updated (max_score, sum_exp, weighted_output)
@@ -168,7 +177,7 @@ def online_softmax_merge(
     
     # Flatten batch dimension (always 1 in our case)
     new_scores = new_scores.squeeze(0)  # [num_new]
-    new_values = new_values.squeeze(0)  # [num_new, H, D]
+    new_values = new_values.squeeze(0).squeeze(1)  # [num_new, D]
     
     # Compute new max
     new_max = new_scores.max()
@@ -184,7 +193,7 @@ def online_softmax_merge(
     # Add new contributions
     exp_new = torch.exp(new_scores - updated_max)  # [num_new]
     sum_exp = sum_exp + exp_new.sum()
-    weighted_output = weighted_output + torch.einsum('n,nhd->hd', exp_new, new_values).unsqueeze(0)
+    weighted_output = weighted_output + torch.einsum('n,nd->d', exp_new, new_values).unsqueeze(0).unsqueeze(0)
     
     max_score = torch.tensor([updated_max], device=max_score.device)
     
@@ -211,28 +220,30 @@ def compute_select_and_merge(
     Compute attention scores, select Top-K nodes, and merge non-selected nodes into softmax state.
     
     Args:
-        layer_k, layer_v: [B, N, H, D] (B=1 in practice)
+        layer_k, layer_v: [1, N, 1, D] Single head data
         node_ranges: [N, 2] Each node covers the token range [start, end)
-        query: [B, H, D] (B=1 in practice)
+        query: [1, 1, D] Single head query
         query_pos: query position m
-        prev_selected_parent_indices: [B, num_selected] or None (top layer)
+        prev_selected_parent_indices: [1, num_selected] or None (top layer)
         compression_rate: compression rate
         layer_idx: current layer index (0: bottom layer)
         rotary: Rotary embedding
         max_score: [1] Current maximum score in softmax accumulation
         sum_exp: [1] Current sum of exponentials
-        weighted_output: [1, H, D] Current weighted output
+        weighted_output: [1, 1, D] Current weighted output (single head)
         top_k: number of selected nodes, 512
         scale: attention scale
     
     Returns:
         max_score: [1] Updated maximum score
         sum_exp: [1] Updated sum of exponentials
-        weighted_output: [1, H, D] Updated weighted output
-        selected_indices: [B, top_k] Selected node indices for next layer (None for bottom layer)
+        weighted_output: [1, 1, D] Updated weighted output (single head)
+        selected_indices: [1, top_k] Selected node indices for next layer (None for bottom layer)
     """
     B, N, H, D = layer_k.shape
     device = layer_k.device
+    
+    assert B == 1 and H == 1, "This function processes single head data"
     
     if scale is None:
         scale = D ** -0.5
@@ -243,7 +254,7 @@ def compute_select_and_merge(
         candidates_mask = node_ranges[:, 0] <= query_pos
     else:
         # 非顶层：只考虑上一层选中节点的子节点
-        parents = prev_selected_parent_indices.reshape(-1)  # [B*M]
+        parents = prev_selected_parent_indices.reshape(-1)  # [M]
         child_offsets = torch.arange(compression_rate, device=device)
         children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
         children = children[children < N]
@@ -268,51 +279,52 @@ def compute_select_and_merge(
     if num_candidates == 0:
         raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
     
-    candidate_k = layer_k[:, candidates_mask]  # [B, num_cand, H, D]
-    candidate_v = layer_v[:, candidates_mask]  # [B, num_cand, H, D]
+    candidate_k = layer_k[:, candidates_mask]  # [1, num_cand, 1, D]
+    candidate_v = layer_v[:, candidates_mask]  # [1, num_cand, 1, D]
     
-    # 应用 RoPE
-    cos = rotary._cos_cache[:num_candidates]
-    sin = rotary._sin_cache[:num_candidates]
+    # 应用 RoPE - 需要先初始化缓存
+    positions = torch.arange(num_candidates, device=device)
+    cos, sin = rotary.forward(positions, device)
     candidate_k_rope = apply_rotary_emb(candidate_k, cos[None, :, None, :], sin[None, :, None, :])
     
-    cos_q = rotary._cos_cache[num_candidates]
-    sin_q = rotary._sin_cache[num_candidates]
+    # Query 使用最后一个位置（与最右侧候选节点相同）
+    cos_q = cos[num_candidates - 1]
+    sin_q = sin[num_candidates - 1]
     query_rope = apply_rotary_emb(query, cos_q, sin_q)
     
-    # 计算注意力分数
-    scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [B, H, num_cand]
-    scores_pooled = scores.mean(dim=1)  # [B, num_cand]
+    # 计算注意力分数 (single head, no pooling)
+    scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
+    scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
     
     # 给最右侧节点加分数加成（仅非底层）
     is_bottom_layer = (layer_idx == 0)
     if not is_bottom_layer:
         rightmost_local_idx = (candidate_indices == rightmost_idx).nonzero(as_tuple=True)[0]
         if rightmost_local_idx.numel() > 0:
-            scores_pooled[:, rightmost_local_idx] += 1e9
+            scores_pooled[rightmost_local_idx] += 1e9
     
     # 确定参与在线Softmax的节点和选中的节点
     if is_bottom_layer:
         # 底层：所有候选节点参与计算
-        merge_scores = scores_pooled
-        merge_values = candidate_v
+        merge_scores = scores_pooled.unsqueeze(0)  # [1, num_cand]
+        merge_values = candidate_v  # [1, num_cand, 1, D]
         selected_indices = None
     else:
         # 非底层：选择Top-K，其余参与计算
         actual_top_k = min(top_k, num_candidates)
-        _, topk_local_idx = torch.topk(scores_pooled, actual_top_k, dim=1)  # [B, actual_top_k]
+        _, topk_local_idx = torch.topk(scores_pooled, actual_top_k, dim=0)  # [actual_top_k]
         
         # 被选中的节点掩码
         selected_mask = torch.zeros(num_candidates, dtype=torch.bool, device=device)
-        selected_mask[topk_local_idx.squeeze(0)] = True
+        selected_mask[topk_local_idx] = True
         
         # 未被选中的节点，参与计算
         merge_mask = ~selected_mask
-        merge_scores = scores_pooled[:, merge_mask]  # [B, num_merge]
-        merge_values = candidate_v[:, merge_mask]  # [B, num_merge, H, D]
+        merge_scores = scores_pooled[merge_mask].unsqueeze(0)  # [1, num_merge]
+        merge_values = candidate_v[:, merge_mask]  # [1, num_merge, 1, D]
         
         # 选中的节点索引
-        selected_indices = candidate_indices[topk_local_idx.squeeze(0)].unsqueeze(0)  # [B, actual_top_k]
+        selected_indices = candidate_indices[topk_local_idx].unsqueeze(0)  # [1, actual_top_k]
     
     # Online softmax merge
     max_score, sum_exp, weighted_output = online_softmax_merge(
@@ -336,7 +348,7 @@ def forward_kernel(
 ) -> torch.Tensor:
     """
     forward kernel with online softmax algorithm
-    
+
     Args:
         q: [B, T, H, D]
         k: [B, T, H, D]
@@ -348,20 +360,26 @@ def forward_kernel(
         max_top_nodes: maximum number of top nodes, 8192
         top_k_per_layer: number of selected nodes per layer, 512
         scale: attention scale
-    
+
     Returns:
         output: [B, T, H, D]
     """
+    nvtx.range_push("Naive_Forward")
     B, T, H, D = q.shape
+    device = q.device
     if scale is None:
         scale = D ** -0.5
-    rotary = Rotary(dim=D)
+    rotary = Rotary(dim=D).to(device)
     
     # 1. Build tree
+    nvtx.range_push("Phase1_BuildTree")
     layers = build_tree(k, v, compression_rate, max_top_nodes)
     num_layers = len(layers)
+    nvtx.range_pop()
     
     # 2. Compute attention for each query position using online softmax
+    # Each head is processed independently
+    nvtx.range_push("Phase2_Attention")
     output = torch.zeros_like(q)
     
     for b in range(B):
@@ -374,40 +392,43 @@ def forward_kernel(
                 batch_positions = [batch_positions]
             positions_to_compute = [p for p in batch_positions if p >= 0]
         
-        for t in positions_to_compute:
-            current_query = q[b:b+1, t]  # [1, H, D]
-            
-            # Initialize online softmax state
-            max_score = torch.tensor([-float('inf')], device=q.device)
-            sum_exp = torch.tensor([0.0], device=q.device)
-            weighted_output = torch.zeros(1, H, D, device=q.device, dtype=q.dtype)
-            
-            # 3. Iterate from top to bottom layer with online softmax merging
-            prev_selected_indices = None
-            
-            for layer_idx in range(num_layers - 1, -1, -1):
-                layer_k, layer_v, node_ranges = layers[layer_idx]
+        for h in range(H):
+            for t in positions_to_compute:
+                current_query = q[b:b+1, t, h:h+1]  # [1, 1, D]
                 
-                max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
-                    layer_k[b:b+1],
-                    layer_v[b:b+1],
-                    node_ranges,
-                    current_query,
-                    t,
-                    prev_selected_indices,
-                    compression_rate,
-                    layer_idx,
-                    rotary,
-                    max_score,
-                    sum_exp,
-                    weighted_output,
-                    top_k_per_layer,
-                    scale
-                )
+                # Initialize online softmax state (per head)
+                max_score = torch.tensor([-float('inf')], device=q.device)
+                sum_exp = torch.tensor([0.0], device=q.device)
+                weighted_output = torch.zeros(1, 1, D, device=q.device, dtype=q.dtype)
                 
-                prev_selected_indices = selected_indices
-            
-            # 4. Normalize to get final output
-            output[b:b+1, t] = weighted_output / sum_exp.unsqueeze(-1)
-    
+                # 3. Iterate from top to bottom layer with online softmax merging
+                prev_selected_indices = None
+                
+                for layer_idx in range(num_layers - 1, -1, -1):
+                    layer_k, layer_v, node_ranges = layers[layer_idx]
+                    
+                    max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
+                        layer_k[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
+                        layer_v[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
+                        node_ranges,
+                        current_query,
+                        t,
+                        prev_selected_indices,
+                        compression_rate,
+                        layer_idx,
+                        rotary,
+                        max_score,
+                        sum_exp,
+                        weighted_output,
+                        top_k_per_layer,
+                        scale
+                    )
+                    
+                    prev_selected_indices = selected_indices
+                
+                # 4. Normalize to get final output
+                output[b:b+1, t, h:h+1] = (weighted_output / sum_exp.unsqueeze(-1)).squeeze(0)
+    nvtx.range_pop()  # Phase2_Attention
+
+    nvtx.range_pop()  # Naive_Forward
     return output

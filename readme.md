@@ -1,6 +1,29 @@
-## Forward Kernel 实现
+# htree 项目文档
 
-naive.py 是一个朴素实现的 PyTorch kernel。
+## 文档结构
+
+本项目包含以下文档：
+
+1. **`doc/htree.md`** - htree 算法的核心设计文档
+   - htree 的树状结构和存储方式
+   - 稀疏注意力机制设计
+   - Forward Kernel 的概念流程（PyTorch 朴素实现）
+
+2. **`doc/parallel_design.md`** - Triton kernel 设计方案（仅设计，不含代码）
+   - 分层归约架构设计
+   - 核心问题与技术挑战分析
+   - Kernel 功能设计和调用流程
+   - 性能预期与优化方向
+
+3. **`doc/parallel_implementation.md`** - Triton kernel 代码实现参考（仅供参考）
+   - 具体的 Triton kernel 代码
+   - 辅助函数实现
+   - 测试与验证代码
+   - **警告**：代码未经完整验证，仅供开发参考
+
+## Forward Kernel 实现（PyTorch 朴素版本）
+
+`src/naive.py` 是一个朴素实现的 PyTorch kernel。
 
 它由以下组件构成：
 
@@ -51,3 +74,25 @@ naive.py 是一个朴素实现的 PyTorch kernel。
 - 保持了数值稳定性，通过动态维护最大值和缩放机制避免指数溢出
 
 它完成了上述完整的 Forward 过程。
+
+---
+
+## Triton Kernel 实现
+
+`src/parallel.py` 实现了 htree 的 Triton kernel 版本，采用四阶段架构。
+
+**主要 Kernel**：
+1. **`htree_build_kernel`** - 树构建：通过 Mean Pooling 逐层生成父节点
+2. **每层三个子 Kernel**（从顶层到底层逐层调用）：
+   - `htree_compute_and_select_kernel` - 候选遍历 + 在线 Softmax + Top-K 选择
+   - `htree_subtract_topk_kernel` - 反向减法移除 Top-K 贡献（非底层）
+   - `htree_merge_to_global_kernel` - 合并到全局状态
+3. **`htree_final_normalize_kernel`** - 最终归一化：输出除以累积和
+
+**关键技术**：
+- **32×16 分块加载**：每批 512 节点通过 32 次 `tl.make_block_ptr` 加载完成
+- **父节点紧凑表示**：512 个索引而非 8192 个，显著降低内存占用
+- **Bitonic Sort Top-K**：每批高效选择并与历史合并
+- **在线 Softmax**：边计算边累积，避免缓存所有候选节点
+
+详细设计请参考 `doc/triton_design.md`。
