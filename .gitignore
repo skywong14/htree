@@ -1,4 +1,3 @@
-doc/
 unit_tests_naive/
 unit_tests_parallel/
 src/__pycache__/
