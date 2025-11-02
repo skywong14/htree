@@ -95,4 +95,4 @@
 - **Bitonic Sort Top-K**：每批高效选择并与历史合并
 - **在线 Softmax**：边计算边累积，避免缓存所有候选节点
 
-详细设计请参考 `doc/triton_design.md`。
+详细设计请参考 `doc/parallel_design.md`。
