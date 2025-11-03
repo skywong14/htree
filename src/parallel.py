@@ -5,7 +5,7 @@ htree (Hierarchical Tree for KV Cache and Sparse Attention) 的 Triton Kernel �
 基于逐层累积架构，使用在线 Softmax 算法实现高效的分层稀疏注意力。
 """
 
-from typing import Optional, Tuple, List
+from typing import Optional
 import torch
 import torch.cuda.nvtx as nvtx
 import triton
@@ -18,9 +18,9 @@ import triton.language as tl
 # @triton.autotune(
 #     configs=[
 #         triton.Config({}, num_warps=num_warps)
-#         for num_warps in [1, 2, 4, 8]
+#         for num_warps in [2, 4, 8]
 #     ],
-#     key=['K', 'V', 'COMPRESSION_RATE'],
+#     key=['K', 'V'],
 # )
 @triton.jit
 def htree_build_kernel(
@@ -35,53 +35,97 @@ def htree_build_kernel(
     K: tl.constexpr,
     V: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
 ):
     """
     Tree building kernel: mean pooling from child nodes to parent nodes
-    Grid: (N_parent, B * H)
-    Each block processes one parent node
+    Grid: (B * H,)
+    Each block processes one (batch, head) combination, handling all parent nodes in that layer
     """
-    i_parent = tl.program_id(0)
-    i_bh = tl.program_id(1)
+    i_bh = tl.program_id(0)
     i_b = i_bh // H
     i_h = i_bh % H
     
-    # child range of parent node
-    child_start = i_parent * COMPRESSION_RATE
-    child_end = tl.minimum(child_start + COMPRESSION_RATE, N_child)
-    num_valid_children = child_end - child_start
+    # 每个 block 处理多个父节点，分批次处理
+    num_iterations = tl.cdiv(N_parent, BLOCK_SIZE)
     
-    # init
-    k_sum = tl.zeros([K], dtype=tl.float32)
-    v_sum = tl.zeros([V], dtype=tl.float32)
-    
-    # accumulate K and V (mean-pooling)
-    for i_child in range(num_valid_children):
-        child_idx = child_start + i_child
+    for iter_idx in range(num_iterations):
+        # 当前批次父节点和子节点的起始位置
+        parent_start = iter_idx * BLOCK_SIZE
+        child_start = parent_start * COMPRESSION_RATE
         
-        # load child_k: [K]
-        k_offset = i_b * N_child * H * K + child_idx * H * K + i_h * K
-        k_ptrs = child_k + k_offset + tl.arange(0, K)
-        k_vals = tl.load(k_ptrs, mask=tl.arange(0, K) < K, other=0.0)
-        k_sum += k_vals
+        # load K: [num_children_in_batch, K]
+        k_base = child_k + i_b * N_child * H * K + i_h * K
+        k_block_ptrs = tl.make_block_ptr(
+            base=k_base,
+            shape=(N_child, K),
+            strides=(H * K, 1),
+            offsets=(child_start, 0),
+            block_shape=(BLOCK_SIZE * COMPRESSION_RATE, K),
+            order=(1, 0)
+        )
+        # load [BLOCK_SIZE * COMPRESSION_RATE, K]
+        k_vals = tl.load(k_block_ptrs, boundary_check=(0, 1))  # [BLOCK_SIZE*16, K]
         
-        # load child_v: [V]
-        v_offset = i_b * N_child * H * V + child_idx * H * V + i_h * V
-        v_ptrs = child_v + v_offset + tl.arange(0, V)
-        v_vals = tl.load(v_ptrs, mask=tl.arange(0, V) < V, other=0.0)
-        v_sum += v_vals
-    
-    k_mean = k_sum / num_valid_children
-    v_mean = v_sum / num_valid_children
-    
-    # store K and V
-    parent_k_offset = i_b * N_parent * H * K + i_parent * H * K + i_h * K
-    parent_k_ptrs = parent_k + parent_k_offset + tl.arange(0, K)
-    tl.store(parent_k_ptrs, k_mean.to(parent_k_ptrs.dtype.element_ty), mask=tl.arange(0, K) < K)
-    
-    parent_v_offset = i_b * N_parent * H * V + i_parent * H * V + i_h * V
-    parent_v_ptrs = parent_v + parent_v_offset + tl.arange(0, V)
-    tl.store(parent_v_ptrs, v_mean.to(parent_v_ptrs.dtype.element_ty), mask=tl.arange(0, V) < V)
+        # load V: [num_children_in_batch, V]
+        v_base = child_v + i_b * N_child * H * V + i_h * V
+        v_block_ptrs = tl.make_block_ptr(
+            base=v_base,
+            shape=(N_child, V),
+            strides=(H * V, 1),
+            offsets=(child_start, 0),
+            block_shape=(BLOCK_SIZE * COMPRESSION_RATE, V),
+            order=(1, 0)
+        )
+        v_vals = tl.load(v_block_ptrs, boundary_check=(0, 1))  # [BLOCK_SIZE*16, V]
+        
+        # Reshape + Mean Pooling
+        
+        # 每个子节点的全局索引: [BLOCK_SIZE, 16]
+        parent_global_idx = parent_start + tl.arange(0, BLOCK_SIZE)  # [BLOCK_SIZE]
+        child_global_idx = parent_global_idx[:, None] * COMPRESSION_RATE + tl.arange(0, COMPRESSION_RATE)[None, :]
+        child_valid = (parent_global_idx[:, None] < N_parent) & (child_global_idx < N_child)  # [BLOCK_SIZE, 16]
+        
+        # Reshape k_vals: [BLOCK_SIZE*16, K] -> [BLOCK_SIZE, 16, K]
+        k_vals_reshaped = tl.reshape(k_vals, [BLOCK_SIZE, COMPRESSION_RATE, K])
+        
+        # 应用 mask 并求和
+        # child_valid: [BLOCK_SIZE, 16] -> [BLOCK_SIZE, 16, 1]
+        k_masked = tl.where(child_valid[:, :, None], k_vals_reshaped, 0.0)
+        k_sum = tl.sum(k_masked, axis=1)  # [BLOCK_SIZE, K]
+        num_valid_children = tl.sum(child_valid.to(tl.int32), axis=1)  # [BLOCK_SIZE]
+        
+        # 计算 mean
+        num_valid_children_safe = tl.maximum(num_valid_children, 1)
+        k_mean = k_sum / num_valid_children_safe[:, None]  # [BLOCK_SIZE, K]
+        v_vals_reshaped = tl.reshape(v_vals, [BLOCK_SIZE, COMPRESSION_RATE, V])
+        v_masked = tl.where(child_valid[:, :, None], v_vals_reshaped, 0.0)
+        v_sum = tl.sum(v_masked, axis=1)  # [BLOCK_SIZE, V]
+        v_mean = v_sum / num_valid_children_safe[:, None]  # [BLOCK_SIZE, V]
+        
+        # store
+        # parent_k: [B, N_parent, H, K]
+        parent_k_base = parent_k + i_b * N_parent * H * K + i_h * K
+        parent_k_block_ptrs = tl.make_block_ptr(
+            base=parent_k_base,
+            shape=(N_parent, K),
+            strides=(H * K, 1),
+            offsets=(parent_start, 0),
+            block_shape=(BLOCK_SIZE, K),
+            order=(1, 0)
+        )
+        tl.store(parent_k_block_ptrs, k_mean.to(parent_k.dtype.element_ty), boundary_check=(0, 1))
+        # parent_v: [B, N_parent, H, V]
+        parent_v_base = parent_v + i_b * N_parent * H * V + i_h * V
+        parent_v_block_ptrs = tl.make_block_ptr(
+            base=parent_v_base,
+            shape=(N_parent, V),
+            strides=(H * V, 1),
+            offsets=(parent_start, 0),
+            block_shape=(BLOCK_SIZE, V),
+            order=(1, 0)
+        )
+        tl.store(parent_v_block_ptrs, v_mean.to(parent_v.dtype.element_ty), boundary_check=(0, 1))
 
 # ==========================================
 # Kernel 2: Layer-by-Layer Forward Pass
@@ -209,6 +253,7 @@ def htree_compute_and_select_kernel(
     layer_output,  # [B, T, H, V]
     topk_indices,  # [B, T, H, TOP_K]
     topk_scores,  # [B, T, H, TOP_K]
+    max_score_excluding_topk_out,  # [B, T, H] 存储被排除节点的最大分数
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr,
@@ -288,7 +333,7 @@ def htree_compute_and_select_kernel(
         b_i = tl.zeros([BC], dtype=tl.float32)
         o_i = tl.full([BC], -1, dtype=tl.int32)
         b_score = tl.full([BC], float('-inf'), dtype=tl.float32)
-        m_i = tl.arange(0, BC) < BC // 2
+        max_score_excluding_topk = float('-inf')
     
     for i_batch in range(num_batches):
         PARENTS_PER_BATCH: tl.constexpr = 32
@@ -410,28 +455,72 @@ def htree_compute_and_select_kernel(
                 )
             )
             
-            b_i_prev = b_i
-            o_i_prev = o_i
-            
             batch_i = importance
             batch_o_i = batch_node_indices
           
-            n_dims: tl.constexpr = 9   # n_dims = 9 (TOP_K = 2^9)
+            n_dims: tl.constexpr = 9   # n_dims = 9 (TOP_K = 2^9 = 512)
             n_outer: tl.constexpr = 1
-            for i_sort in tl.static_range(1, n_dims):
-                batch_i, batch_o_i = _bitonic_merge(batch_i, batch_o_i, i_sort, 2, n_dims, n_outer)
+            
+            # 对当前批次排序（降序）
+            for i_sort in tl.static_range(1, n_dims + 1):
+                batch_i, batch_o_i = _bitonic_merge(batch_i, batch_o_i, i_sort, 2 if i_sort < n_dims else True, n_dims, n_outer)
             
             if i_batch != 0:
-                batch_i, batch_o_i = _bitonic_merge(batch_i, batch_o_i, n_dims, False, n_dims, n_outer)
+                # 精确 Top-K：将历史512和当前512合并为1024，排序后取前512
+                merged_size: tl.constexpr = BC * 2  # 1024
+                merged_n_dims: tl.constexpr = 10    # 2^10 = 1024
+                merged_n_outer: tl.constexpr = 1
                 
-                b_i_merged = b_i_prev * m_i + batch_i * (1 - m_i)
-                o_i_merged = o_i_prev * m_i + batch_o_i * (1 - m_i)
+                # 使用 reshape 技巧创建 [1024] 数组：
+                # 1. 创建 [2, 512] 的 2D 数组
+                # 2. 第0行填充历史 Top-K，第1行填充当前批次
+                # 3. reshape 成 [1024]
                 
-                b_i, o_i = _bitonic_merge(b_i_merged, o_i_merged, n_dims, True, n_dims, n_outer)
+                o_row = tl.arange(0, 2)[:, None]     # [2, 1]
+                o_col = tl.arange(0, BC)[None, :]    # [1, 512]
+                
+                # 创建 [2, 512] 数组：第0行=b_i，第1行=batch_i
+                merged_2d_i = tl.where(
+                    o_row == 0,
+                    b_i[None, :],      # broadcast [512] to [2, 512]
+                    batch_i[None, :]
+                )
+                merged_2d_o_i = tl.where(
+                    o_row == 0,
+                    o_i[None, :],
+                    batch_o_i[None, :]
+                )
+                
+                # Reshape 成 [1024]: [b_i[0]...b_i[511], batch_i[0]...batch_i[511]]
+                merged_i = tl.reshape(merged_2d_i, [merged_size])
+                merged_o_i = tl.reshape(merged_2d_o_i, [merged_size])
+                
+                # 对1024个元素排序（降序）
+                for i_sort in tl.static_range(1, merged_n_dims + 1):
+                    merged_i, merged_o_i = _bitonic_merge(
+                        merged_i, merged_o_i, i_sort, 
+                        2 if i_sort < merged_n_dims else True, 
+                        merged_n_dims, merged_n_outer
+                    )
+                
+                # 取前512个作为新的 Top-K
+                # 将 [1024] reshape 成 [2, 512]，取第0行
+                merged_2d_sorted_i = tl.reshape(merged_i, [2, BC])
+                merged_2d_sorted_o_i = tl.reshape(merged_o_i, [2, BC])
+                
+                # 提取第0行（前512个元素）
+                o_row_extract = tl.arange(0, 2)[:, None]
+                mask_first_row = (o_row_extract == 0)
+                
+                # 保留第 0 行，其他行置 0，然后沿 axis=0 求和 [512]
+                b_i = tl.sum(tl.where(mask_first_row, merged_2d_sorted_i, 0.0), axis=0)
+                o_i = tl.sum(tl.where(mask_first_row, merged_2d_sorted_o_i, 0), axis=0)
             else:
-                b_i, o_i = _bitonic_merge(batch_i, batch_o_i, n_dims, True, n_dims, n_outer)
+                # 第一批：直接使用排序后的当前批次
+                b_i = batch_i
+                o_i = batch_o_i
             
-            # 当节点索引 >= 0 且相等时才认为匹配
+            # 当节点索引 >= 0 且相等时才认为匹配 (TODO 更准确的逻辑？)
             match_matrix = (o_i[:, None] == batch_node_indices[None, :]) & (o_i[:, None] >= 0)
             
             matched_scores = tl.sum(tl.where(match_matrix, batch_scores[None, :], 0.0), axis=1)
@@ -441,6 +530,17 @@ def htree_compute_and_select_kernel(
                 b_score = tl.where(is_in_current_batch, matched_scores, b_score)
             else:
                 b_score = tl.where(is_in_current_batch, matched_scores, float('-inf'))
+            
+            # 计算被排除节点的最大分数
+            # 判断当前批次的节点是否在 Top-K 中: [BC]
+            is_in_topk = tl.sum(match_matrix.to(tl.int32), axis=0) > 0
+            # 被排除的节点：有效但不在 Top-K 中
+            is_excluded = valid_child_mask_flat & (~is_in_topk)
+            # 被排除节点的分数（无效节点设为 -inf）
+            excluded_scores = tl.where(is_excluded, batch_scores, float('-inf'))
+            # 更新全局最大被排除分数
+            batch_max_excluded = tl.max(excluded_scores)
+            max_score_excluding_topk = tl.maximum(max_score_excluding_topk, batch_max_excluded)
     
     # 存储当前层状态
     state_offset = i_b * T * H + i_t * H + i_h
@@ -461,11 +561,13 @@ def htree_compute_and_select_kernel(
         tl.store(topk_indices_ptrs, o_i.to(topk_indices_ptrs.dtype.element_ty))
         
         # 无效索引对应的 b_score 为 -inf
-        # TODO 可能有误
         b_score_corrected = tl.where(o_i >= 0, b_score, float('-inf'))
         
         topk_scores_ptrs = topk_scores + topk_offset + o_topk
         tl.store(topk_scores_ptrs, b_score_corrected)
+        
+        # 存储被排除节点的最大分数
+        tl.store(max_score_excluding_topk_out + state_offset, max_score_excluding_topk)
 
 
 # ==========================================
@@ -489,6 +591,7 @@ def htree_subtract_topk_kernel(
     layer_sum,  # [B, T, H]
     layer_output,  # [B, T, H, V]
     selected_indices,  # [B, T, H, TOP_K]
+    max_score_excluding_topk_in,  # [B, T, H] 排除TopK节点的最大分数
     B: tl.constexpr,
     T: tl.constexpr,
     H: tl.constexpr,
@@ -529,19 +632,21 @@ def htree_subtract_topk_kernel(
     # 步骤 1: 对 Top-K 索引排序
     # ======================================
     
-    topk_indices_sorted = topk_indices_unsorted
+    # 准备排序数据：将无效索引 -1 替换为 MAX_IDX
+    MAX_IDX = 2147483647
+    topk_indices_for_sort = tl.where(topk_indices_unsorted >= 0, topk_indices_unsorted, MAX_IDX)
     indices_positions = tl.arange(0, TOP_K).to(tl.int32)
     
-    n_dims: tl.constexpr = 9
-    n_outer: tl.constexpr = 1
-    
-    MAX_IDX = 2147483647
-    topk_indices_for_sort = tl.where(topk_indices_sorted >= 0, topk_indices_sorted, MAX_IDX)
-    
-    for i_sort in tl.static_range(1, n_dims + 1):
-        topk_indices_for_sort, indices_positions = _bitonic_merge(
-            topk_indices_for_sort, indices_positions, i_sort, False, n_dims, n_outer
-        )
+    # 升序排序
+    # TOP_K = 512, n_dims = log2(512) = 9, n_outer = 1（1D数组）
+    topk_n_dims: tl.constexpr = 9  # log2(TOP_K) where TOP_K = 512
+    topk_indices_for_sort, indices_positions = argsort(
+        topk_indices_for_sort,
+        indices_positions,
+        n_dims=topk_n_dims,
+        n_outer=1,
+        descending=False
+    )
     
     topk_indices_sorted = tl.where(topk_indices_for_sort < MAX_IDX, topk_indices_for_sort, -1)
     
@@ -554,7 +659,6 @@ def htree_subtract_topk_kernel(
     # ======================================
     
     # [TOP_K]
-    # 使用索引判断有效性
     is_valid_topk = (topk_indices_unsorted >= 0)
     
     # 对于有效节点，使用实际分数；对于无效节点，使用 -inf
@@ -615,6 +719,17 @@ def htree_subtract_topk_kernel(
         cur_sum = cur_sum - topk_sum_scaled
         cur_output = cur_output - topk_output_scaled
     
+    # ======================================
+    # 步骤 4: 更新 cur_max 为被排除节点的最大分数
+    # ======================================
+    
+    # TODO 加入该部分后效率明显降低?
+    # 读取被排除节点的最大分数
+    max_excluded = tl.load(max_score_excluding_topk_in + state_offset)
+    # 如果 cur_sum <= 0（所有节点都被选中），cur_max 应为 -inf
+    # 否则使用被排除节点的最大分数
+    cur_max = tl.where(cur_sum <= 1e-10, float('-inf'), max_excluded)
+    
     tl.store(layer_max + state_offset, cur_max)
     tl.store(layer_sum + state_offset, cur_sum)
     tl.store(output_ptrs, cur_output, mask=o_v < V)
@@ -664,14 +779,41 @@ def htree_merge_to_global_kernel(
     global_output_ptrs = global_output + output_offset + o_v
     g_output_vals = tl.load(global_output_ptrs, mask=o_v < V, other=0.0)
     
-    # Online Softmax
-    new_max = tl.maximum(g_max, cur_max)
-    scale_g = tl.exp(g_max - new_max)
-    scale_c = tl.exp(cur_max - new_max)
+    # Online Softmax 合并（处理 -inf 的特殊情况，避免 nan）
+    # 情况1: 当前层无贡献（cur_sum <= 0）→ 保持全局状态
+    # 情况2: 全局无累积（g_sum <= 0）→ 使用当前层状态
+    # 情况3: 两者都有贡献 → 正常在线 Softmax 合并
     
-    g_sum = g_sum * scale_g + cur_sum * scale_c
-    g_output_vals = g_output_vals * scale_g + cur_output * scale_c
-    g_max = new_max
+    cur_has_contribution = cur_sum > 1e-10
+    g_has_accumulation = g_sum > 1e-10
+    
+    # 计算合并结果，使用安全的 scale 避免 -inf - (-inf) = nan
+    new_max = tl.maximum(g_max, cur_max)
+    # 如果对应的状态没有贡献，scale 设为 0（避免 exp(-inf - x) 的计算）
+    scale_g = tl.where(g_has_accumulation, tl.exp(g_max - new_max), 0.0)
+    scale_c = tl.where(cur_has_contribution, tl.exp(cur_max - new_max), 0.0)
+    
+    merged_sum = g_sum * scale_g + cur_sum * scale_c
+    merged_output = g_output_vals * scale_g + cur_output * scale_c
+    merged_max = new_max
+    
+    # 根据不同情况选择最终结果
+    g_max = tl.where(
+        cur_has_contribution,
+        tl.where(g_has_accumulation, merged_max, cur_max),  # 两者都有贡献用合并值，否则用当前值
+        g_max  # 当前层无贡献，保持全局不变
+    )
+    g_sum = tl.where(
+        cur_has_contribution,
+        tl.where(g_has_accumulation, merged_sum, cur_sum),
+        g_sum
+    )
+    g_output_vals = tl.where(
+        cur_has_contribution,
+        tl.where(g_has_accumulation, merged_output, cur_output),
+        g_output_vals
+    )
+    
     
     # write back
     tl.store(global_max + state_offset, g_max)
@@ -788,13 +930,17 @@ def htree_forward(
         next_k = torch.empty(B, next_len, H, K, dtype=dtype, device=device)
         next_v = torch.empty(B, next_len, H, V, dtype=dtype, device=device)
         
-        grid = (next_len, B * H)
+        # 新设计: Grid = (B * H,)，每个 block 处理一层
+        # BLOCK_SIZE 控制每次处理的父节点数量
+        BLOCK_SIZE = 128  # 可以根据 K, V, next_len 调整
+        grid = (B * H,)
         htree_build_kernel[grid](
             current_k, current_v, next_k, next_v,
             N_child=current_len,
             N_parent=next_len,
             B=B, H=H, K=K, V=V,
             COMPRESSION_RATE=compression_rate,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
         
         layers_k.append(next_k)
@@ -839,6 +985,9 @@ def htree_forward(
     topk_indices = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
     topk_scores = torch.empty([B, T, H, top_k_per_layer], dtype=torch.float32, device=device)
     
+    # 被排除节点的最大分数（非底层）
+    max_score_excluding_topk = torch.empty([B, T, H], dtype=torch.float32, device=device)
+    
     # 选中节点索引缓存 (层间复用)
     selected_indices = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
     
@@ -881,6 +1030,7 @@ def htree_forward(
             cos_cache, sin_cache,
             layer_max, layer_sum, layer_output,
             topk_indices, topk_scores,
+            max_score_excluding_topk,
             layer_idx=layer_idx,
             layer_power=layer_power,
             B=B, T=T, H=H, K=K, V=V, N_layer=N_layer,
@@ -901,6 +1051,7 @@ def htree_forward(
                 topk_indices, topk_scores,
                 layer_max, layer_sum, layer_output,
                 selected_indices,
+                max_score_excluding_topk,
                 B=B, T=T, H=H, V=V, N_layer=N_layer,
                 TOP_K=top_k_per_layer,
             )
@@ -957,8 +1108,9 @@ def _compare_and_swap(
     flip,
     i: tl.constexpr,
     n_dims: tl.constexpr,
+    n_outer: tl.constexpr,
 ):
-    n_outer: tl.constexpr = x.numel >> n_dims
+    # n_outer: tl.constexpr = x.numel >> n_dims
     shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
     y = tl.reshape(x, shape)
     # slice left/right with 'stride' 2**(n_dims - i - 1)
@@ -1009,5 +1161,18 @@ def _bitonic_merge(
         flip = order
     # perform `stage` rounds of `compare-and-swap`
     for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
+        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims, n_outer)
+    return x, ids
+
+@triton.jit
+def argsort(
+    x,
+    ids,
+    n_dims: tl.constexpr,
+    n_outer: tl.constexpr,
+    descending: tl.constexpr = tl.core.CONSTEXPR_0,
+):
+    # iteratively run bitonic merge-sort steps
+    for i in tl.static_range(1, n_dims + 1):
+        x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending, n_dims, n_outer)
     return x, ids

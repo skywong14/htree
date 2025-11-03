@@ -18,7 +18,7 @@ def test_compare_with_naive():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # 测试数据
-    B, T, H, K, V = 1, 10000, 1, 16, 16
+    B, T, H, K, V = 1, 10000, 1, 4, 4
     
     q = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
     k = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
@@ -36,7 +36,7 @@ def test_compare_with_naive():
     print("="*80 + "\n")
     
     # 只测试几个 query 位置
-    test_positions = [0, 32]
+    test_positions = [0, 32,64,100,200,1000,8000,9000,9500]
     query_positions = torch.tensor([test_positions], device=device).expand(B, -1)
     
     # Naive 实现

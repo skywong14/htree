@@ -4,3 +4,5 @@ src/__pycache__/
 old_versions/
 old_doc/
 reference_nsa/
+__pycache__/
+*debug*.py
