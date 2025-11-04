@@ -461,11 +461,27 @@ def htree_compute_and_select_kernel(
             n_dims: tl.constexpr = 9   # n_dims = 9 (TOP_K = 2^9 = 512)
             n_outer: tl.constexpr = 1
             
-            # 对当前批次排序（降序）
+            # argsort 对当前批次排序（降序）
+            # batch_i, batch_o_i = argsort(batch_i, batch_o_i, n_dims, n_outer, descending=True)
+            
+            # argsort
             for i_sort in tl.static_range(1, n_dims + 1):
                 batch_i, batch_o_i = _bitonic_merge(batch_i, batch_o_i, i_sort, 2 if i_sort < n_dims else True, n_dims, n_outer)
             
             if i_batch != 0:
+                # fix：用新的 cur_max 重新计算历史节点的 importance
+                # 否则历史节点和当前节点的 importance 基准不同，导致排序错误
+                is_rightmost_historical = (o_i == rightmost_idx)
+                b_i = tl.where(
+                    is_rightmost_historical,
+                    1.0,
+                    tl.where(
+                        o_i >= 0,  # 只重新计算有效节点
+                        tl.exp(b_score - cur_max),
+                        0.0
+                    )
+                )
+                
                 # 精确 Top-K：将历史512和当前512合并为1024，排序后取前512
                 merged_size: tl.constexpr = BC * 2  # 1024
                 merged_n_dims: tl.constexpr = 10    # 2^10 = 1024
@@ -495,7 +511,10 @@ def htree_compute_and_select_kernel(
                 merged_i = tl.reshape(merged_2d_i, [merged_size])
                 merged_o_i = tl.reshape(merged_2d_o_i, [merged_size])
                 
-                # 对1024个元素排序（降序）
+                # 对1024个元素排序（降序） - 使用 argsort
+                # merged_i, merged_o_i = argsort(merged_i, merged_o_i, merged_n_dims, merged_n_outer, descending=True)
+                
+                # 原始实现（使用 _bitonic_merge 循环）：
                 for i_sort in tl.static_range(1, merged_n_dims + 1):
                     merged_i, merged_o_i = _bitonic_merge(
                         merged_i, merged_o_i, i_sort, 
