@@ -483,6 +483,7 @@ def htree_compute_and_select_kernel(
                 )
                 
                 # 精确 Top-K：将历史512和当前512合并为1024，排序后取前512
+                # 使用三路排序同时维护 (importance, node_id, score) 三元组
                 merged_size: tl.constexpr = BC * 2  # 1024
                 merged_n_dims: tl.constexpr = 10    # 2^10 = 1024
                 merged_n_outer: tl.constexpr = 1
@@ -495,29 +496,33 @@ def htree_compute_and_select_kernel(
                 o_row = tl.arange(0, 2)[:, None]     # [2, 1]
                 o_col = tl.arange(0, BC)[None, :]    # [1, 512]
                 
-                # 创建 [2, 512] 数组：第0行=b_i，第1行=batch_i
+                # 创建 [2, 512] 数组：第0行=历史，第1行=当前批次
                 merged_2d_i = tl.where(
                     o_row == 0,
-                    b_i[None, :],      # broadcast [512] to [2, 512]
+                    b_i[None, :],      # importance
                     batch_i[None, :]
                 )
                 merged_2d_o_i = tl.where(
                     o_row == 0,
-                    o_i[None, :],
+                    o_i[None, :],      # node_id
                     batch_o_i[None, :]
                 )
+                merged_2d_score = tl.where(
+                    o_row == 0,
+                    b_score[None, :],  # score (fix)
+                    batch_scores[None, :]
+                )
                 
-                # Reshape 成 [1024]: [b_i[0]...b_i[511], batch_i[0]...batch_i[511]]
+                # Reshape 成 [1024]
                 merged_i = tl.reshape(merged_2d_i, [merged_size])
                 merged_o_i = tl.reshape(merged_2d_o_i, [merged_size])
+                merged_score = tl.reshape(merged_2d_score, [merged_size])
                 
-                # 对1024个元素排序（降序） - 使用 argsort
-                # merged_i, merged_o_i = argsort(merged_i, merged_o_i, merged_n_dims, merged_n_outer, descending=True)
-                
-                # 原始实现（使用 _bitonic_merge 循环）：
+                # 对1024个元素排序（降序） - 使用三路 bitonic merge
+                # 排序基于 merged_i (importance)，merged_o_i 和 merged_score 跟着重排
                 for i_sort in tl.static_range(1, merged_n_dims + 1):
-                    merged_i, merged_o_i = _bitonic_merge(
-                        merged_i, merged_o_i, i_sort, 
+                    merged_i, merged_o_i, merged_score = _bitonic_merge_triple(
+                        merged_i, merged_o_i, merged_score, i_sort, 
                         2 if i_sort < merged_n_dims else True, 
                         merged_n_dims, merged_n_outer
                     )
@@ -526,6 +531,7 @@ def htree_compute_and_select_kernel(
                 # 将 [1024] reshape 成 [2, 512]，取第0行
                 merged_2d_sorted_i = tl.reshape(merged_i, [2, BC])
                 merged_2d_sorted_o_i = tl.reshape(merged_o_i, [2, BC])
+                merged_2d_sorted_score = tl.reshape(merged_score, [2, BC])
                 
                 # 提取第0行（前512个元素）
                 o_row_extract = tl.arange(0, 2)[:, None]
@@ -534,17 +540,23 @@ def htree_compute_and_select_kernel(
                 # 保留第 0 行，其他行置 0，然后沿 axis=0 求和 [512]
                 b_i = tl.sum(tl.where(mask_first_row, merged_2d_sorted_i, 0.0), axis=0)
                 o_i = tl.sum(tl.where(mask_first_row, merged_2d_sorted_o_i, 0), axis=0)
+                b_score = tl.sum(tl.where(mask_first_row, merged_2d_sorted_score, 0.0), axis=0)
+                
+                # FIX COMPLETE: 现在 b_i, o_i, b_score 三者在排序后仍然保持对应关系
             else:
                 # 第一批：直接使用排序后的当前批次
                 b_i = batch_i
                 o_i = batch_o_i
+                # 注意：b_score 需要在后续通过 match_matrix 初始化
             
-            # 当节点索引 >= 0 且相等时才认为匹配 (TODO 更准确的逻辑？)
+            # 当节点索引 >= 0 且相等时才认为匹配
             match_matrix = (o_i[:, None] == batch_node_indices[None, :]) & (o_i[:, None] >= 0)
             
             matched_scores = tl.sum(tl.where(match_matrix, batch_scores[None, :], 0.0), axis=1)
             is_in_current_batch = tl.sum(match_matrix.to(tl.int32), axis=1) > 0
             
+            # 更新 b_score：只需要更新在当前批次中的节点
+            # 不在当前批次的节点，其 b_score 已经在三路排序中正确维护
             if i_batch != 0:
                 b_score = tl.where(is_in_current_batch, matched_scores, b_score)
             else:
@@ -1157,6 +1169,67 @@ def _compare_and_swap(
 
 
 @triton.jit
+def _compare_and_swap_triple(
+    x,
+    ids,
+    aux,
+    flip,
+    i: tl.constexpr,
+    n_dims: tl.constexpr,
+    n_outer: tl.constexpr,
+):
+    """
+    Compare-and-swap for three arrays: (x, ids, aux)
+    Sorting is based on x, but ids and aux follow the same permutation.
+    """
+    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
+    
+    # Process x (the sorting key)
+    y = tl.reshape(x, shape)
+    mask = tl.arange(0, 2)[None, :, None]
+    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
+    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
+    left = tl.reshape(left, x.shape)
+    right = tl.reshape(right, x.shape)
+    
+    # Process ids
+    y_idx = tl.reshape(ids, shape)
+    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
+    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
+    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
+    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
+    
+    # Process aux
+    y_aux = tl.reshape(aux, shape)
+    left_aux = tl.broadcast_to(tl.sum(y_aux * (1 - mask), 1)[:, None, :], shape).to(y_aux.dtype)
+    right_aux = tl.broadcast_to(tl.sum(y_aux * mask, 1)[:, None, :], shape).to(y_aux.dtype)
+    left_aux = tl.reshape(left_aux, x.shape)
+    right_aux = tl.reshape(right_aux, x.shape)
+    
+    # Determine swap condition based on x
+    cond = (left > right) != flip
+    
+    # Swap x using bitcast trick
+    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
+    ileft = left.to(idtype, bitcast=True)
+    iright = right.to(idtype, bitcast=True)
+    ix = x.to(idtype, bitcast=True)
+    ret_x = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
+    
+    # Swap ids
+    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
+    
+    # Swap aux using bitcast trick
+    idtype_aux = tl.core.get_int_dtype(bitwidth=aux.dtype.primitive_bitwidth, signed=True)
+    ileft_aux = left_aux.to(idtype_aux, bitcast=True)
+    iright_aux = right_aux.to(idtype_aux, bitcast=True)
+    iaux = aux.to(idtype_aux, bitcast=True)
+    ret_aux = iaux ^ tl.where(cond, ileft_aux ^ iright_aux, tl.zeros_like(iaux))
+    
+    return ret_x.to(x.dtype, bitcast=True), new_ids, ret_aux.to(aux.dtype, bitcast=True)
+
+
+@triton.jit
 def _bitonic_merge(
     x,
     ids,
@@ -1182,6 +1255,31 @@ def _bitonic_merge(
     for i in tl.static_range(stage):
         x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims, n_outer)
     return x, ids
+
+
+@triton.jit
+def _bitonic_merge_triple(
+    x,
+    ids,
+    aux,
+    stage: tl.constexpr,
+    order: tl.constexpr,
+    n_dims: tl.constexpr,
+    n_outer: tl.constexpr,
+):
+    """
+    Bitonic merge operation for sorting three arrays simultaneously.
+    Sorting is based on x, ids and aux follow the same permutation.
+    """
+    if order == 2:
+        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
+        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
+    else:
+        flip = order
+    # perform `stage` rounds of `compare-and-swap`
+    for i in tl.static_range(stage):
+        x, ids, aux = _compare_and_swap_triple(x, ids, aux, flip, i + (n_dims - stage), n_dims, n_outer)
+    return x, ids, aux
 
 @triton.jit
 def argsort(
