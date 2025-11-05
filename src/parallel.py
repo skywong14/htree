@@ -376,21 +376,24 @@ def htree_compute_and_select_kernel(
         
         scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], float('-inf'), dtype=tl.float32)
         values_2d = tl.zeros([PARENTS_PER_BATCH, COMPRESSION_RATE, V], dtype=tl.float32)
-        # range or tl.static_range?
+        
         for i_p in tl.static_range(PARENTS_PER_BATCH):
             parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
             
             if parent_idx >= 0:
                 child_start = parent_idx * COMPRESSION_RATE
-                
-                is_rightmost = (child_start // COMPRESSION_RATE == rightmost_idx // COMPRESSION_RATE)
-                num_valid_children = tl.where(
-                    is_rightmost,
-                    (rightmost_idx % COMPRESSION_RATE) + 1,
-                    COMPRESSION_RATE
-                )
-                
                 rope_pos_start = i_batch * BC + i_p * COMPRESSION_RATE
+                
+                # 使用 mask 从 valid_child_mask_2d 中提取当前父节点的子节点 mask
+                # valid_child_mask_2d: [32, 16]
+                # 创建选择第 i_p 行的 mask
+                row_selector = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)  # [32, 1]
+                # 提取第 i_p 行: 将非目标行置0，然后沿 axis=0 求和得到 [16]
+                current_parent_mask = tl.sum(
+                    tl.where(row_selector, valid_child_mask_2d.to(tl.int32), 0),
+                    axis=0
+                ).to(tl.int1)  # [16]
+                num_valid_children = tl.sum(current_parent_mask.to(tl.int32))
                 
                 # 加载 Key 并应用 RoPE
                 k_rope_1, k_rope_2 = load_k_with_rope(
@@ -406,14 +409,16 @@ def htree_compute_and_select_kernel(
                     N_layer, H, V, COMPRESSION_RATE
                 )
                 
+                # 使用外层计算的统一 mask 填充 scores_2d 和 values_2d
+                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
                 scores_2d = tl.where(
-                    (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p) & (tl.arange(0, COMPRESSION_RATE)[None, :] < COMPRESSION_RATE),
+                    is_current_parent & valid_child_mask_2d,
                     scores_16[None, :],
                     scores_2d
                 )
                 values_2d = tl.where(
-                    (tl.arange(0, PARENTS_PER_BATCH)[:, None, None] == i_p) & 
-                    (tl.arange(0, COMPRESSION_RATE)[None, :, None] < COMPRESSION_RATE) &
+                    is_current_parent[:, :, None] & 
+                    valid_child_mask_2d[:, :, None] &
                     (tl.arange(0, V)[None, None, :] < V),
                     v_vals[None, :, :],
                     values_2d
@@ -427,6 +432,9 @@ def htree_compute_and_select_kernel(
         valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
         batch_scores = tl.where(valid_child_mask_flat, batch_scores, float('-inf'))
         
+        # 将无效节点的 Value 置零
+        batch_values = tl.where(valid_child_mask_flat[:, None], batch_values, 0.0)
+
         # 子节点索引
         batch_node_indices = tl.reshape(child_indices_2d, [BC])
         batch_node_indices = tl.where(valid_child_mask_flat, batch_node_indices, -1)
@@ -443,13 +451,12 @@ def htree_compute_and_select_kernel(
         # Top-K 选择 (非底层)
         if not is_bottom_layer:
             is_rightmost = (batch_node_indices == rightmost_idx)
-            is_valid = (batch_scores > float('-inf'))
             
             importance = tl.where(
                 is_rightmost,
                 1.0,
                 tl.where(
-                    is_valid,
+                    batch_node_indices >= 0,
                     tl.exp(batch_scores - cur_max),
                     0.0
                 )
@@ -457,16 +464,18 @@ def htree_compute_and_select_kernel(
             
             batch_i = importance
             batch_o_i = batch_node_indices
+            batch_s = batch_scores  # 保持 score 与 node_id 的对应关系
           
             n_dims: tl.constexpr = 9   # n_dims = 9 (TOP_K = 2^9 = 512)
             n_outer: tl.constexpr = 1
             
-            # argsort 对当前批次排序（降序）
-            # batch_i, batch_o_i = argsort(batch_i, batch_o_i, n_dims, n_outer, descending=True)
-            
-            # argsort
+            # 三路排序 (importance, node_id, score)
             for i_sort in tl.static_range(1, n_dims + 1):
-                batch_i, batch_o_i = _bitonic_merge(batch_i, batch_o_i, i_sort, 2 if i_sort < n_dims else True, n_dims, n_outer)
+                batch_i, batch_o_i, batch_s = _bitonic_merge_triple(
+                    batch_i, batch_o_i, batch_s, i_sort, 
+                    2 if i_sort < n_dims else True, 
+                    n_dims, n_outer
+                )
             
             if i_batch != 0:
                 # fix：用新的 cur_max 重新计算历史节点的 importance
@@ -488,11 +497,9 @@ def htree_compute_and_select_kernel(
                 merged_n_dims: tl.constexpr = 10    # 2^10 = 1024
                 merged_n_outer: tl.constexpr = 1
                 
-                # 使用 reshape 技巧创建 [1024] 数组：
                 # 1. 创建 [2, 512] 的 2D 数组
                 # 2. 第0行填充历史 Top-K，第1行填充当前批次
                 # 3. reshape 成 [1024]
-                
                 o_row = tl.arange(0, 2)[:, None]     # [2, 1]
                 o_col = tl.arange(0, BC)[None, :]    # [1, 512]
                 
@@ -509,8 +516,8 @@ def htree_compute_and_select_kernel(
                 )
                 merged_2d_score = tl.where(
                     o_row == 0,
-                    b_score[None, :],  # score (fix)
-                    batch_scores[None, :]
+                    b_score[None, :],  # score
+                    batch_s[None, :]   # 使用排序后的 batch_s
                 )
                 
                 # Reshape 成 [1024]
@@ -518,7 +525,7 @@ def htree_compute_and_select_kernel(
                 merged_o_i = tl.reshape(merged_2d_o_i, [merged_size])
                 merged_score = tl.reshape(merged_2d_score, [merged_size])
                 
-                # 对1024个元素排序（降序） - 使用三路 bitonic merge
+                # 对1024个元素排序 (降序) - 使用三路 bitonic merge
                 # 排序基于 merged_i (importance)，merged_o_i 和 merged_score 跟着重排
                 for i_sort in tl.static_range(1, merged_n_dims + 1):
                     merged_i, merged_o_i, merged_score = _bitonic_merge_triple(
@@ -533,7 +540,7 @@ def htree_compute_and_select_kernel(
                 merged_2d_sorted_o_i = tl.reshape(merged_o_i, [2, BC])
                 merged_2d_sorted_score = tl.reshape(merged_score, [2, BC])
                 
-                # 提取第0行（前512个元素）
+                # 提取第0行 (前512个元素)
                 o_row_extract = tl.arange(0, 2)[:, None]
                 mask_first_row = (o_row_extract == 0)
                 
@@ -542,36 +549,28 @@ def htree_compute_and_select_kernel(
                 o_i = tl.sum(tl.where(mask_first_row, merged_2d_sorted_o_i, 0), axis=0)
                 b_score = tl.sum(tl.where(mask_first_row, merged_2d_sorted_score, 0.0), axis=0)
                 
-                # FIX COMPLETE: 现在 b_i, o_i, b_score 三者在排序后仍然保持对应关系
+                # 提取第513个元素 (Top K+1) 作为被排除节点的最大分数
+                # merged_2d_sorted_score[1, 0] 即第二行第一个元素
+                mask_second_row_first = (o_row_extract == 1) & (tl.arange(0, BC)[None, :] == 0)
+                top_kplus1_score = tl.sum(tl.where(mask_second_row_first, merged_2d_sorted_score, 0.0))
+                max_score_excluding_topk = tl.maximum(max_score_excluding_topk, top_kplus1_score)
             else:
                 # 第一批：直接使用排序后的当前批次
                 b_i = batch_i
                 o_i = batch_o_i
-                # 注意：b_score 需要在后续通过 match_matrix 初始化
+                b_score = batch_s  # 使用排序后的 batch_s
             
-            # 当节点索引 >= 0 且相等时才认为匹配
-            match_matrix = (o_i[:, None] == batch_node_indices[None, :]) & (o_i[:, None] >= 0)
-            
-            matched_scores = tl.sum(tl.where(match_matrix, batch_scores[None, :], 0.0), axis=1)
-            is_in_current_batch = tl.sum(match_matrix.to(tl.int32), axis=1) > 0
+            # 注意：后续不再需要 match_matrix 来初始化 b_score
+            # 因为 b_score 已经通过三路排序正确维护了
             
             # 更新 b_score：只需要更新在当前批次中的节点
             # 不在当前批次的节点，其 b_score 已经在三路排序中正确维护
             if i_batch != 0:
+                # 当节点索引 >= 0 且相等时才认为匹配
+                match_matrix = (o_i[:, None] == batch_node_indices[None, :]) & (o_i[:, None] >= 0)
+                matched_scores = tl.sum(tl.where(match_matrix, batch_scores[None, :], 0.0), axis=1)
+                is_in_current_batch = tl.sum(match_matrix.to(tl.int32), axis=1) > 0
                 b_score = tl.where(is_in_current_batch, matched_scores, b_score)
-            else:
-                b_score = tl.where(is_in_current_batch, matched_scores, float('-inf'))
-            
-            # 计算被排除节点的最大分数
-            # 判断当前批次的节点是否在 Top-K 中: [BC]
-            is_in_topk = tl.sum(match_matrix.to(tl.int32), axis=0) > 0
-            # 被排除的节点：有效但不在 Top-K 中
-            is_excluded = valid_child_mask_flat & (~is_in_topk)
-            # 被排除节点的分数（无效节点设为 -inf）
-            excluded_scores = tl.where(is_excluded, batch_scores, float('-inf'))
-            # 更新全局最大被排除分数
-            batch_max_excluded = tl.max(excluded_scores)
-            max_score_excluding_topk = tl.maximum(max_score_excluding_topk, batch_max_excluded)
     
     # 存储当前层状态
     state_offset = i_b * T * H + i_t * H + i_h
@@ -669,7 +668,7 @@ def htree_subtract_topk_kernel(
     indices_positions = tl.arange(0, TOP_K).to(tl.int32)
     
     # 升序排序
-    # TOP_K = 512, n_dims = log2(512) = 9, n_outer = 1（1D数组）
+    # TOP_K = 512, n_dims = log2(512) = 9, n_outer = 1 (1D数组)
     topk_n_dims: tl.constexpr = 9  # log2(TOP_K) where TOP_K = 512
     topk_indices_for_sort, indices_positions = argsort(
         topk_indices_for_sort,
@@ -700,7 +699,7 @@ def htree_subtract_topk_kernel(
     
     # 计算所有节点的指数权重
     # [TOP_K]
-    # 先将无效节点的分数设为一个安全值（比如 topk_max - 100），避免 exp(-inf)
+    # 先将无效节点的分数设为一个安全值 (比如 topk_max - 100)，避免 exp(-inf)
     # 这样 exp(topk_max - 100 - topk_max) = exp(-100) ≈ 0，而不会产生 NaN
     safe_scores_for_exp = tl.where(is_valid_topk, topk_scores_vals, topk_max - 100.0)
     topk_exp = tl.where(is_valid_topk, tl.exp(safe_scores_for_exp - topk_max), 0.0)
@@ -739,27 +738,43 @@ def htree_subtract_topk_kernel(
     topk_output = tl.sum(topk_exp[:, None] * topk_values, axis=0)  # [V]
     
     # ======================================
-    # 步骤 3: 从当前累积中移除 Top-K 贡献
+    # 步骤 3: 确定新的 cur_max (被排除节点的最大分数)
     # ======================================
     
+    # 读取被排除节点的最大分数
+    max_excluded = tl.load(max_score_excluding_topk_in + state_offset)
+    
+    # 保存旧的 cur_max
+    old_cur_max = cur_max
+    
+    # ======================================
+    # 步骤 4: 先将 cur_sum 和 cur_output 重新缩放到 new_cur_max 基准
+    # ======================================
+    
+    # 新的 cur_max 是被排除节点的最大分数
+    new_cur_max = max_excluded
+    
+    # 将当前累积从 old_cur_max 缩放到 new_cur_max
+    # scale_factor = exp(old_cur_max - new_cur_max)
+    scale_factor = tl.exp(old_cur_max - new_cur_max)
+    cur_sum = cur_sum * scale_factor
+    cur_output = cur_output * scale_factor
+    
+    # ======================================
+    # 步骤 5: 从重新缩放后的累积中移除 Top-K 贡献
+    # ======================================
+    
+    # 现在 Top-K 的贡献也需要基于 new_cur_max 计算
     if topk_sum > 0:
-        topk_scale = tl.exp(topk_max - cur_max)
+        topk_scale = tl.exp(topk_max - new_cur_max)
         topk_sum_scaled = topk_sum * topk_scale
         topk_output_scaled = topk_output * topk_scale
         
         cur_sum = cur_sum - topk_sum_scaled
         cur_output = cur_output - topk_output_scaled
     
-    # ======================================
-    # 步骤 4: 更新 cur_max 为被排除节点的最大分数
-    # ======================================
-    
-    # TODO 加入该部分后效率明显降低?
-    # 读取被排除节点的最大分数
-    max_excluded = tl.load(max_score_excluding_topk_in + state_offset)
-    # 如果 cur_sum <= 0（所有节点都被选中），cur_max 应为 -inf
-    # 否则使用被排除节点的最大分数
-    cur_max = tl.where(cur_sum <= 1e-10, float('-inf'), max_excluded)
+    # 如果减去后 cur_sum <= 0 (所有节点都被选中)，更新 cur_max 为 -inf
+    cur_max = tl.where(cur_sum <= 1e-10, float('-inf'), new_cur_max)
     
     tl.store(layer_max + state_offset, cur_max)
     tl.store(layer_sum + state_offset, cur_sum)
@@ -810,9 +825,9 @@ def htree_merge_to_global_kernel(
     global_output_ptrs = global_output + output_offset + o_v
     g_output_vals = tl.load(global_output_ptrs, mask=o_v < V, other=0.0)
     
-    # Online Softmax 合并（处理 -inf 的特殊情况，避免 nan）
-    # 情况1: 当前层无贡献（cur_sum <= 0）→ 保持全局状态
-    # 情况2: 全局无累积（g_sum <= 0）→ 使用当前层状态
+    # Online Softmax 合并 (处理 -inf 的特殊情况，避免 nan)
+    # 情况1: 当前层无贡献 (cur_sum <= 0)→ 保持全局状态
+    # 情况2: 全局无累积 (g_sum <= 0)→ 使用当前层状态
     # 情况3: 两者都有贡献 → 正常在线 Softmax 合并
     
     cur_has_contribution = cur_sum > 1e-10
@@ -820,7 +835,7 @@ def htree_merge_to_global_kernel(
     
     # 计算合并结果，使用安全的 scale 避免 -inf - (-inf) = nan
     new_max = tl.maximum(g_max, cur_max)
-    # 如果对应的状态没有贡献，scale 设为 0（避免 exp(-inf - x) 的计算）
+    # 如果对应的状态没有贡献，scale 设为 0 (避免 exp(-inf - x) 的计算)
     scale_g = tl.where(g_has_accumulation, tl.exp(g_max - new_max), 0.0)
     scale_c = tl.where(cur_has_contribution, tl.exp(cur_max - new_max), 0.0)
     
@@ -1007,27 +1022,28 @@ def htree_forward(
     nvtx.range_push("Phase3_LayerByLayer_Forward")
     print("Phase 3: Layer-by-layer forward pass...")
     
-    # 分配中间状态张量（层内复用）
+    # 分配中间状态张量 (层内复用)
     layer_max = torch.empty([B, T, H], dtype=torch.float32, device=device)
     layer_sum = torch.empty([B, T, H], dtype=torch.float32, device=device)
     layer_output = torch.empty([B, T, H, V], dtype=torch.float32, device=device)
     
-    # Top-K 信息（非底层）
+    # Top-K 信息 (非底层)
     topk_indices = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
     topk_scores = torch.empty([B, T, H, top_k_per_layer], dtype=torch.float32, device=device)
     
-    # 被排除节点的最大分数（非底层）
+    # 被排除节点的最大分数 (非底层)
     max_score_excluding_topk = torch.empty([B, T, H], dtype=torch.float32, device=device)
     
     # 选中节点索引缓存 (层间复用)
     selected_indices = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
     
-    # 为最顶层初始化 prev_selected_parents（虚拟父节点）
+    # 为最顶层初始化 prev_selected_parents (虚拟父节点)
     top_layer_power = compression_rate ** (num_layers - 1)
     
     t_indices = torch.arange(T, dtype=torch.int32, device=device)  # [T]
-    rightmost_indices = t_indices // top_layer_power  # [T] 顶层最右侧节点
-    num_virtual_parents = rightmost_indices // compression_rate + 1  # [T] 虚拟父节点数量
+    rightmost_indices = t_indices // top_layer_power  # [T] 顶层最右侧节点索引
+    # 虚拟父节点数量：每个虚拟父节点展开成16个顶层节点
+    num_virtual_parents = rightmost_indices // compression_rate + 1  # [T]
     
     # [T, TOP_K]
     parent_candidates = torch.arange(top_k_per_layer, dtype=torch.int32, device=device).unsqueeze(0).expand(T, -1)
@@ -1126,6 +1142,7 @@ __all__ = [
     'htree_forward',
     'htree_build_kernel',
     'htree_compute_and_select_kernel',
+    'htree_compute_only_kernel',
     'htree_subtract_topk_kernel',
     'htree_merge_to_global_kernel',
     'htree_final_normalize_kernel',
@@ -1293,3 +1310,244 @@ def argsort(
     for i in tl.static_range(1, n_dims + 1):
         x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending, n_dims, n_outer)
     return x, ids
+
+
+# ==========================================
+# Kernel 2.1 Simple: 仅计算和累积（用于调试）
+# ==========================================
+
+@triton.jit
+def htree_compute_only_kernel(
+    q,  # [B, T, H, K]
+    layer_k,  # [B, N_layer, H, K]
+    layer_v,  # [B, N_layer, H, V]
+    prev_selected_parents,  # [B, T, H, TOP_K]，-1 表示 padding
+    cos_cache,  # [cache_size, K//2]
+    sin_cache,  # [cache_size, K//2]
+    layer_max,  # [B, T, H]
+    layer_sum,  # [B, T, H]
+    layer_output,  # [B, T, H, V]
+    debug_scores_batches,  # [B, T, H, max_batches, BC] 用于调试，存储每批次的 scores
+    debug_values_batches,  # [B, T, H, max_batches, BC, V] 用于调试，存储每批次的 values
+    max_batches: tl.constexpr,  # 最大批次数
+    layer_idx: tl.constexpr,
+    layer_power: tl.constexpr,
+    B: tl.constexpr,
+    T: tl.constexpr,
+    H: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    N_layer: tl.constexpr,
+    COMPRESSION_RATE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    scale: tl.constexpr,
+):
+    """
+    简化版 Kernel 2.1: 只进行候选节点遍历和在线 Softmax 累积，不做 Top-K 选择
+    用于调试 output 向量的计算
+    Grid: (T, B*H)
+    """
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+    
+    is_bottom_layer: tl.constexpr = (layer_idx == 0)
+    BC: tl.constexpr = TOP_K
+    
+    # ======================================
+    # 阶段 1: 确定候选节点范围与 Padding
+    # ======================================
+    
+    rightmost_idx = i_t // layer_power
+    
+    prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+    o_parent = tl.arange(0, TOP_K)
+    
+    parent_list = tl.load(prev_selected_parents + prev_sel_base + o_parent)
+    
+    valid_mask1 = parent_list >= 0
+    num_valid_parents = tl.sum(valid_mask1.to(tl.int32))
+    
+    num_batches = (num_valid_parents + 31) // 32
+    
+    # ======================================
+    # 阶段 2: 应用 RoPE 到 Query
+    # ======================================
+    
+    if num_valid_parents > 0:
+        num_candidates = (num_valid_parents - 1) * COMPRESSION_RATE + (rightmost_idx % COMPRESSION_RATE) + 1
+    else:
+        num_candidates = 0
+    
+    rope_pos_q = tl.maximum(num_candidates - 1, 0)
+    
+    q_offset = i_b * T * H * K + i_t * H * K + i_h * K
+    o_k = tl.arange(0, K // 2)
+    
+    q1_ptrs = q + q_offset + o_k
+    q2_ptrs = q + q_offset + (K // 2) + o_k
+    q1 = tl.load(q1_ptrs)
+    q2 = tl.load(q2_ptrs)
+    
+    cos_ptrs = cos_cache + rope_pos_q * (K // 2) + o_k
+    sin_ptrs = sin_cache + rope_pos_q * (K // 2) + o_k
+    cos_q = tl.load(cos_ptrs)
+    sin_q = tl.load(sin_ptrs)
+    
+    q_rope_1 = (q1 * cos_q - q2 * sin_q) * scale
+    q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
+    
+    # ======================================
+    # 阶段 3: 批次遍历候选节点 (BC=512，32x16 加载)
+    # ======================================
+    
+    # init
+    cur_max = float('-inf')
+    cur_sum = 0.0
+    cur_output = tl.zeros([V], dtype=tl.float32)
+    
+    for i_batch in range(num_batches):
+        PARENTS_PER_BATCH: tl.constexpr = 32
+        
+        # 加载 32 个父节点索引
+        o_parent_local = tl.arange(0, PARENTS_PER_BATCH)
+        parent_indices = tl.load(
+            prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + o_parent_local,
+            mask=o_parent_local < PARENTS_PER_BATCH,
+            other=-1
+        )  # [32]
+        
+        # mask
+        valid_parent_mask = parent_indices >= 0  # [32]
+        
+        # 子节点起始位置
+        child_starts = parent_indices * COMPRESSION_RATE  # [32]
+        child_starts = tl.where(valid_parent_mask, child_starts, 0)  # 无效位置用0占位
+        
+        # 判断最右侧父节点
+        is_rightmost_parent = (child_starts // COMPRESSION_RATE == rightmost_idx // COMPRESSION_RATE)  # [32]
+        num_valid_children_per_parent = tl.where(
+            is_rightmost_parent,
+            (rightmost_idx % COMPRESSION_RATE) + 1,
+            COMPRESSION_RATE
+        )  # [32]
+        
+        # 构建 2D 索引 [32, 16]
+        o_parent_2d = tl.arange(0, PARENTS_PER_BATCH)[:, None]  # [32, 1]
+        o_child_offset = tl.arange(0, COMPRESSION_RATE)[None, :]  # [1, 16]
+        
+        # 子节点全局索引 [32, 16]
+        child_indices_2d = child_starts[:, None] + o_child_offset  # [32, 16]
+        
+        # mask [32, 16]
+        valid_child_mask_2d = (
+            valid_parent_mask[:, None] &  # 父节点有效
+            (o_child_offset < num_valid_children_per_parent[:, None])  # 子节点在范围内
+        )
+        
+        scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], float('-inf'), dtype=tl.float32)
+        values_2d = tl.zeros([PARENTS_PER_BATCH, COMPRESSION_RATE, V], dtype=tl.float32)
+        
+        for i_p in tl.static_range(PARENTS_PER_BATCH):
+            parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
+            
+            if parent_idx >= 0:
+                child_start = parent_idx * COMPRESSION_RATE
+                rope_pos_start = i_batch * BC + i_p * COMPRESSION_RATE
+                
+                # 使用 mask 从 valid_child_mask_2d 中提取当前父节点的子节点 mask
+                # valid_child_mask_2d: [32, 16]
+                # 创建选择第 i_p 行的 mask
+                row_selector = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)  # [32, 1]
+                # 提取第 i_p 行: 将非目标行置0，然后沿 axis=0 求和得到 [16]
+                current_parent_mask = tl.sum(
+                    tl.where(row_selector, valid_child_mask_2d.to(tl.int32), 0),
+                    axis=0
+                ).to(tl.int1)  # [16]
+                num_valid_children = tl.sum(current_parent_mask.to(tl.int32))
+                
+                # 加载 Key 并应用 RoPE
+                k_rope_1, k_rope_2 = load_k_with_rope(
+                    layer_k, cos_cache, sin_cache,
+                    i_b, i_h, child_start, rope_pos_start,
+                    N_layer, H, K, COMPRESSION_RATE, num_valid_children
+                )
+                
+                scores_16 = tl.sum(q_rope_1[None, :] * k_rope_1, axis=1) + \
+                           tl.sum(q_rope_2[None, :] * k_rope_2, axis=1)
+                v_vals = load_v(
+                    layer_v, i_b, i_h, child_start,
+                    N_layer, H, V, COMPRESSION_RATE
+                )
+                
+                # 使用外层计算的统一 mask 填充 scores_2d 和 values_2d
+                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
+                scores_2d = tl.where(
+                    is_current_parent & valid_child_mask_2d,
+                    scores_16[None, :],
+                    scores_2d
+                )
+                values_2d = tl.where(
+                    is_current_parent[:, :, None] & 
+                    valid_child_mask_2d[:, :, None] &
+                    (tl.arange(0, V)[None, None, :] < V),
+                    v_vals[None, :, :],
+                    values_2d
+                )
+        
+        # Flatten 到 [BC] = [512]
+        batch_scores = tl.reshape(scores_2d, [BC])
+        batch_values = tl.reshape(values_2d, [BC, V])
+        
+        # 应用 mask
+        valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
+        batch_scores = tl.where(valid_child_mask_flat, batch_scores, float('-inf'))
+        
+        # 显式地将无效节点的 Value 置零，避免累积错误数据
+        batch_values = tl.where(valid_child_mask_flat[:, None], batch_values, 0.0)
+        
+        # 保存当前批次的 scores 和 values 用于调试
+        if i_batch < max_batches:
+            # 存储 batch_scores: [B, T, H, max_batches, BC]
+            debug_scores_offset = i_b * T * H * max_batches * BC + i_t * H * max_batches * BC + i_h * max_batches * BC + i_batch * BC
+            o_bc = tl.arange(0, BC)
+            debug_scores_ptrs = debug_scores_batches + debug_scores_offset + o_bc
+            tl.store(debug_scores_ptrs, batch_scores)
+            
+            # 存储 batch_values: [B, T, H, max_batches, BC, V]
+            # 使用 2D 索引访问，符合 Triton 规范
+            debug_values_offset = i_b * T * H * max_batches * BC * V + i_t * H * max_batches * BC * V + i_h * max_batches * BC * V + i_batch * BC * V
+            o_bc_2d = tl.arange(0, BC)[:, None]  # [BC, 1]
+            o_v = tl.arange(0, V)  # [V]
+            
+            # 使用 where 和 sum 来选择数据
+            # batch_values: [BC, V]
+            for i_bc in tl.static_range(BC):
+                # 创建 mask 选择第 i_bc 行
+                row_mask = (o_bc_2d == i_bc)  # [BC, 1]
+                # 从 batch_values 中提取第 i_bc 行: [V]
+                selected_row = tl.sum(tl.where(row_mask, batch_values, 0.0), axis=0)  # [V]
+                # 存储
+                debug_v_ptrs = debug_values_batches + debug_values_offset + i_bc * V + o_v
+                tl.store(debug_v_ptrs, selected_row, mask=o_v < V)
+        
+        # Online Softmax
+        new_max = tl.maximum(cur_max, tl.max(batch_scores))
+        scale_old = tl.exp(cur_max - new_max)
+        scale_batch = tl.exp(batch_scores - new_max)
+        
+        cur_sum = cur_sum * scale_old + tl.sum(scale_batch)
+        cur_output = cur_output * scale_old + tl.sum(scale_batch[:, None] * batch_values, axis=0)
+        cur_max = new_max
+    
+    # 存储当前层状态
+    state_offset = i_b * T * H + i_t * H + i_h
+    tl.store(layer_max + state_offset, cur_max)
+    tl.store(layer_sum + state_offset, cur_sum)
+    
+    output_offset = i_b * T * H * V + i_t * H * V + i_h * V
+    o_v = tl.arange(0, V)
+    output_ptrs = layer_output + output_offset + o_v
+    tl.store(output_ptrs, cur_output, mask=o_v < V)
+

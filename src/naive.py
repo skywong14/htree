@@ -334,6 +334,132 @@ def compute_select_and_merge(
     return max_score, sum_exp, weighted_output, selected_indices
 
 
+def compute_and_select_only(
+    layer_k: torch.Tensor,
+    layer_v: torch.Tensor,
+    node_ranges: torch.Tensor,
+    query: torch.Tensor,
+    query_pos: int,
+    prev_selected_parent_indices: Optional[torch.Tensor],
+    compression_rate: int,
+    layer_idx: int,
+    rotary: Rotary,
+    max_score: torch.Tensor,
+    sum_exp: torch.Tensor,
+    weighted_output: torch.Tensor,
+    top_k: int = 512,
+    scale: Optional[float] = None
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    """
+    Compute attention scores, select Top-K nodes, and merge ALL candidates into softmax state.
+    This simulates Kernel 2.1 behavior (before subtract_topk).
+    
+    Args:
+        Same as compute_select_and_merge
+    
+    Returns:
+        max_score: [1] Updated maximum score (after merging ALL candidates)
+        sum_exp: [1] Updated sum of exponentials (after merging ALL candidates)
+        weighted_output: [1, 1, D] Updated weighted output (after merging ALL candidates)
+        selected_indices: [1, top_k] Selected node indices for next layer (None for bottom layer)
+        topk_indices_unsorted: [top_k] Top-K indices in importance order (padded with -1)
+        topk_scores_unsorted: [top_k] Top-K scores in importance order
+    """
+    B, N, H, D = layer_k.shape
+    device = layer_k.device
+    
+    assert B == 1 and H == 1, "This function processes single head data"
+    
+    if scale is None:
+        scale = D ** -0.5
+    
+    # 确定候选节点范围
+    if prev_selected_parent_indices is None:
+        # 顶层：考虑所有左边界 ≤ m 的节点
+        candidates_mask = node_ranges[:, 0] <= query_pos
+    else:
+        # 非顶层：只考虑上一层选中节点的子节点
+        parents = prev_selected_parent_indices.reshape(-1)  # [M]
+        child_offsets = torch.arange(compression_rate, device=device)
+        children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
+        children = children[children < N]
+        
+        # 过滤：只保留左边界 ≤ m 的节点
+        valid_mask = node_ranges[:, 0] <= query_pos
+        valid_children = children[valid_mask[children]]
+        
+        candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        candidates_mask[valid_children] = True
+    
+    # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
+    rightmost_idx = query_pos // (compression_rate ** layer_idx)
+    if rightmost_idx < N:
+        candidates_mask[rightmost_idx] = True
+    
+    # 提取候选节点
+    candidate_indices = torch.where(candidates_mask)[0]  # [num_cand]
+    candidate_indices = torch.sort(candidate_indices)[0]  # 确保有序
+    num_candidates = candidate_indices.numel()
+    
+    if num_candidates == 0:
+        raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
+    
+    candidate_k = layer_k[:, candidates_mask]  # [1, num_cand, 1, D]
+    candidate_v = layer_v[:, candidates_mask]  # [1, num_cand, 1, D]
+    
+    # 应用 RoPE - 需要先初始化缓存
+    positions = torch.arange(num_candidates, device=device)
+    cos, sin = rotary.forward(positions, device)
+    candidate_k_rope = apply_rotary_emb(candidate_k, cos[None, :, None, :], sin[None, :, None, :])
+    
+    # Query 使用最后一个位置（与最右侧候选节点相同）
+    cos_q = cos[num_candidates - 1]
+    sin_q = sin[num_candidates - 1]
+    query_rope = apply_rotary_emb(query, cos_q, sin_q)
+    
+    # 计算注意力分数 (single head, no pooling)
+    scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
+    scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
+    
+    # 保存原始分数（用于 merge）
+    scores_original = scores_pooled.clone()
+    
+    # 给最右侧节点加分数加成（仅非底层，只用于 Top-K 选择）
+    is_bottom_layer = (layer_idx == 0)
+    if not is_bottom_layer:
+        rightmost_local_idx = (candidate_indices == rightmost_idx).nonzero(as_tuple=True)[0]
+        if rightmost_local_idx.numel() > 0:
+            scores_pooled[rightmost_local_idx] += 1e9
+    
+    # Merge ALL candidates into softmax state (Kernel 2.1 behavior)
+    # 使用原始分数（无 1e9 加分），避免污染 online softmax
+    merge_scores = scores_original.unsqueeze(0)  # [1, num_cand]
+    merge_values = candidate_v  # [1, num_cand, 1, D]
+    
+    max_score, sum_exp, weighted_output = online_softmax_merge(
+        max_score, sum_exp, weighted_output, merge_scores, merge_values
+    )
+    
+    # Select Top-K for next layer (but don't subtract them yet)
+    if is_bottom_layer:
+        selected_indices = None
+        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
+        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
+    else:
+        actual_top_k = min(top_k, num_candidates)
+        topk_scores, topk_local_idx = torch.topk(scores_pooled, actual_top_k, dim=0)  # [actual_top_k]
+        
+        # 选中的节点索引
+        selected_indices = candidate_indices[topk_local_idx].unsqueeze(0)  # [1, actual_top_k]
+        
+        # 返回未排序的 Top-K 信息（按重要性顺序，padded with -1）
+        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
+        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
+        
+        topk_indices_unsorted[:actual_top_k] = candidate_indices[topk_local_idx].to(torch.int32)
+        topk_scores_unsorted[:actual_top_k] = topk_scores
+    
+    return max_score, sum_exp, weighted_output, selected_indices, topk_indices_unsorted, topk_scores_unsorted
 
 
 def forward_kernel(
