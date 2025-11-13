@@ -257,14 +257,14 @@ def htree_compute_and_select_kernel(
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
-    scale: tl.constexpr,
+    scale,
 ):
     """
     Kernel 2.1: 候选节点遍历 + 在线 Softmax + Top-K 选择
@@ -623,7 +623,7 @@ def htree_subtract_topk_kernel(
     selected_indices,  # [B, T, H, TOP_K]
     max_score_excluding_topk_in,  # [B, T, H] 排除TopK节点的最大分数
     B: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     V: tl.constexpr,
     N_layer: tl.constexpr,
@@ -794,7 +794,7 @@ def htree_merge_to_global_kernel(
     global_sum,  # [B, T, H]
     global_output,  # [B, T, H, V]
     B: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     V: tl.constexpr,
 ):
@@ -877,7 +877,7 @@ def htree_final_normalize_kernel(
     global_sum,  # [B, T, H]
     output,  # [B, T, H, V]
     B: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     V: tl.constexpr,
 ):
@@ -1333,14 +1333,14 @@ def htree_compute_only_kernel(
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr,
-    T: tl.constexpr,
+    T,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
-    scale: tl.constexpr,
+    scale,
 ):
     """
     简化版 Kernel 2.1: 只进行候选节点遍历和在线 Softmax 累积，不做 Top-K 选择
