@@ -6,3 +6,4 @@ old_doc/
 reference_nsa/
 __pycache__/
 *debug*.py
+*.nsys-rep

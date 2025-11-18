@@ -11,6 +11,10 @@ import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
 
+# 常量定义：用于标记无效/未初始化的分数
+# 选择 -1e10 而非 -inf 避免 NaN 传播
+INVALID_SCORE = -1e10
+
 # ==========================================
 # Kernel 1: Tree Building (逐层构建)
 # ==========================================
@@ -137,8 +141,8 @@ def load_k_with_rope(
     layer_k,
     cos_cache,
     sin_cache,
-    i_b: tl.constexpr,
-    i_h: tl.constexpr,
+    i_b,
+    i_h,
     child_start,
     rope_position_start,
     N_layer: tl.constexpr,
@@ -200,8 +204,8 @@ def load_k_with_rope(
 @triton.jit
 def load_v(
     layer_v,
-    i_b: tl.constexpr,
-    i_h: tl.constexpr,
+    i_b,
+    i_h,
     child_start,
     N_layer: tl.constexpr,
     H: tl.constexpr,
@@ -326,14 +330,14 @@ def htree_compute_and_select_kernel(
     # ======================================
     
     # init
-    cur_max = float('-inf')
+    cur_max = -1e10
     cur_sum = 0.0
     cur_output = tl.zeros([V], dtype=tl.float32)
     if not is_bottom_layer:
         b_i = tl.zeros([BC], dtype=tl.float32)
         o_i = tl.full([BC], -1, dtype=tl.int32)
-        b_score = tl.full([BC], float('-inf'), dtype=tl.float32)
-        max_score_excluding_topk = float('-inf')
+        b_score = tl.full([BC], -1e10, dtype=tl.float32)
+        max_score_excluding_topk = -1e10
     
     for i_batch in range(num_batches):
         PARENTS_PER_BATCH: tl.constexpr = 32
@@ -374,7 +378,7 @@ def htree_compute_and_select_kernel(
             (o_child_offset < num_valid_children_per_parent[:, None])  # 子节点在范围内
         )
         
-        scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], float('-inf'), dtype=tl.float32)
+        scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], -1e10, dtype=tl.float32)
         values_2d = tl.zeros([PARENTS_PER_BATCH, COMPRESSION_RATE, V], dtype=tl.float32)
         
         for i_p in tl.static_range(PARENTS_PER_BATCH):
@@ -430,7 +434,7 @@ def htree_compute_and_select_kernel(
         
         # 应用 mask
         valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
-        batch_scores = tl.where(valid_child_mask_flat, batch_scores, float('-inf'))
+        batch_scores = tl.where(valid_child_mask_flat, batch_scores, -1e10)
         
         # 将无效节点的 Value 置零
         batch_values = tl.where(valid_child_mask_flat[:, None], batch_values, 0.0)
@@ -590,8 +594,8 @@ def htree_compute_and_select_kernel(
         topk_indices_ptrs = topk_indices + topk_offset + o_topk
         tl.store(topk_indices_ptrs, o_i.to(topk_indices_ptrs.dtype.element_ty))
         
-        # 无效索引对应的 b_score 为 -inf
-        b_score_corrected = tl.where(o_i >= 0, b_score, float('-inf'))
+        # 无效索引对应的 b_score 为 -1e10
+        b_score_corrected = tl.where(o_i >= 0, b_score, -1e10)
         
         topk_scores_ptrs = topk_scores + topk_offset + o_topk
         tl.store(topk_scores_ptrs, b_score_corrected)
@@ -691,8 +695,8 @@ def htree_subtract_topk_kernel(
     # [TOP_K]
     is_valid_topk = (topk_indices_unsorted >= 0)
     
-    # 对于有效节点，使用实际分数；对于无效节点，使用 -inf
-    safe_scores = tl.where(is_valid_topk, topk_scores_vals, float('-inf'))
+    # 对于有效节点，使用实际分数；对于无效节点，使用 -1e10
+    safe_scores = tl.where(is_valid_topk, topk_scores_vals, -1e10)
     
     # 全局最大值
     topk_max = tl.max(safe_scores)
@@ -773,8 +777,8 @@ def htree_subtract_topk_kernel(
         cur_sum = cur_sum - topk_sum_scaled
         cur_output = cur_output - topk_output_scaled
     
-    # 如果减去后 cur_sum <= 0 (所有节点都被选中)，更新 cur_max 为 -inf
-    cur_max = tl.where(cur_sum <= 1e-10, float('-inf'), new_cur_max)
+    # 当 cur_sum <= 0 时，表示所有节点都被移除，设置 cur_max 为标记值
+    cur_max = tl.where(cur_sum <= 1e-10, -1e10, new_cur_max)
     
     tl.store(layer_max + state_offset, cur_max)
     tl.store(layer_sum + state_offset, cur_sum)
@@ -825,7 +829,7 @@ def htree_merge_to_global_kernel(
     global_output_ptrs = global_output + output_offset + o_v
     g_output_vals = tl.load(global_output_ptrs, mask=o_v < V, other=0.0)
     
-    # Online Softmax 合并 (处理 -inf 的特殊情况，避免 nan)
+    # Online Softmax 合并 (处理无效值 -1e10 的特殊情况，避免 nan)
     # 情况1: 当前层无贡献 (cur_sum <= 0)→ 保持全局状态
     # 情况2: 全局无累积 (g_sum <= 0)→ 使用当前层状态
     # 情况3: 两者都有贡献 → 正常在线 Softmax 合并
@@ -1013,7 +1017,7 @@ def htree_forward(
     nvtx.range_push("Phase2_Init_GlobalState")
     print("Phase 2: Initializing global states...")
     
-    global_max = torch.full([B, T, H], float('-inf'), dtype=torch.float32, device=device)
+    global_max = torch.full([B, T, H], -1e10, dtype=torch.float32, device=device)
     global_sum = torch.zeros([B, T, H], dtype=torch.float32, device=device)
     global_output = torch.zeros([B, T, H, V], dtype=torch.float32, device=device)
     nvtx.range_pop()
@@ -1118,7 +1122,7 @@ def htree_forward(
         
         # update parent indices (pass to next layer)
         if not is_bottom_layer:
-            prev_selected_parents = selected_indices
+            prev_selected_parents, selected_indices = selected_indices, prev_selected_parents
         
         nvtx.range_pop()
     nvtx.range_pop()
@@ -1142,7 +1146,6 @@ __all__ = [
     'htree_forward',
     'htree_build_kernel',
     'htree_compute_and_select_kernel',
-    'htree_compute_only_kernel',
     'htree_subtract_topk_kernel',
     'htree_merge_to_global_kernel',
     'htree_final_normalize_kernel',
@@ -1310,244 +1313,3 @@ def argsort(
     for i in tl.static_range(1, n_dims + 1):
         x, ids = _bitonic_merge(x, ids, i, 2 if i < n_dims else descending, n_dims, n_outer)
     return x, ids
-
-
-# ==========================================
-# Kernel 2.1 Simple: 仅计算和累积（用于调试）
-# ==========================================
-
-@triton.jit
-def htree_compute_only_kernel(
-    q,  # [B, T, H, K]
-    layer_k,  # [B, N_layer, H, K]
-    layer_v,  # [B, N_layer, H, V]
-    prev_selected_parents,  # [B, T, H, TOP_K]，-1 表示 padding
-    cos_cache,  # [cache_size, K//2]
-    sin_cache,  # [cache_size, K//2]
-    layer_max,  # [B, T, H]
-    layer_sum,  # [B, T, H]
-    layer_output,  # [B, T, H, V]
-    debug_scores_batches,  # [B, T, H, max_batches, BC] 用于调试，存储每批次的 scores
-    debug_values_batches,  # [B, T, H, max_batches, BC, V] 用于调试，存储每批次的 values
-    max_batches: tl.constexpr,  # 最大批次数
-    layer_idx: tl.constexpr,
-    layer_power: tl.constexpr,
-    B: tl.constexpr,
-    T,
-    H: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    N_layer: tl.constexpr,
-    COMPRESSION_RATE: tl.constexpr,
-    TOP_K: tl.constexpr,
-    scale,
-):
-    """
-    简化版 Kernel 2.1: 只进行候选节点遍历和在线 Softmax 累积，不做 Top-K 选择
-    用于调试 output 向量的计算
-    Grid: (T, B*H)
-    """
-    i_t = tl.program_id(0)
-    i_bh = tl.program_id(1)
-    i_b = i_bh // H
-    i_h = i_bh % H
-    
-    is_bottom_layer: tl.constexpr = (layer_idx == 0)
-    BC: tl.constexpr = TOP_K
-    
-    # ======================================
-    # 阶段 1: 确定候选节点范围与 Padding
-    # ======================================
-    
-    rightmost_idx = i_t // layer_power
-    
-    prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
-    o_parent = tl.arange(0, TOP_K)
-    
-    parent_list = tl.load(prev_selected_parents + prev_sel_base + o_parent)
-    
-    valid_mask1 = parent_list >= 0
-    num_valid_parents = tl.sum(valid_mask1.to(tl.int32))
-    
-    num_batches = (num_valid_parents + 31) // 32
-    
-    # ======================================
-    # 阶段 2: 应用 RoPE 到 Query
-    # ======================================
-    
-    if num_valid_parents > 0:
-        num_candidates = (num_valid_parents - 1) * COMPRESSION_RATE + (rightmost_idx % COMPRESSION_RATE) + 1
-    else:
-        num_candidates = 0
-    
-    rope_pos_q = tl.maximum(num_candidates - 1, 0)
-    
-    q_offset = i_b * T * H * K + i_t * H * K + i_h * K
-    o_k = tl.arange(0, K // 2)
-    
-    q1_ptrs = q + q_offset + o_k
-    q2_ptrs = q + q_offset + (K // 2) + o_k
-    q1 = tl.load(q1_ptrs)
-    q2 = tl.load(q2_ptrs)
-    
-    cos_ptrs = cos_cache + rope_pos_q * (K // 2) + o_k
-    sin_ptrs = sin_cache + rope_pos_q * (K // 2) + o_k
-    cos_q = tl.load(cos_ptrs)
-    sin_q = tl.load(sin_ptrs)
-    
-    q_rope_1 = (q1 * cos_q - q2 * sin_q) * scale
-    q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
-    
-    # ======================================
-    # 阶段 3: 批次遍历候选节点 (BC=512，32x16 加载)
-    # ======================================
-    
-    # init
-    cur_max = float('-inf')
-    cur_sum = 0.0
-    cur_output = tl.zeros([V], dtype=tl.float32)
-    
-    for i_batch in range(num_batches):
-        PARENTS_PER_BATCH: tl.constexpr = 32
-        
-        # 加载 32 个父节点索引
-        o_parent_local = tl.arange(0, PARENTS_PER_BATCH)
-        parent_indices = tl.load(
-            prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + o_parent_local,
-            mask=o_parent_local < PARENTS_PER_BATCH,
-            other=-1
-        )  # [32]
-        
-        # mask
-        valid_parent_mask = parent_indices >= 0  # [32]
-        
-        # 子节点起始位置
-        child_starts = parent_indices * COMPRESSION_RATE  # [32]
-        child_starts = tl.where(valid_parent_mask, child_starts, 0)  # 无效位置用0占位
-        
-        # 判断最右侧父节点
-        is_rightmost_parent = (child_starts // COMPRESSION_RATE == rightmost_idx // COMPRESSION_RATE)  # [32]
-        num_valid_children_per_parent = tl.where(
-            is_rightmost_parent,
-            (rightmost_idx % COMPRESSION_RATE) + 1,
-            COMPRESSION_RATE
-        )  # [32]
-        
-        # 构建 2D 索引 [32, 16]
-        o_parent_2d = tl.arange(0, PARENTS_PER_BATCH)[:, None]  # [32, 1]
-        o_child_offset = tl.arange(0, COMPRESSION_RATE)[None, :]  # [1, 16]
-        
-        # 子节点全局索引 [32, 16]
-        child_indices_2d = child_starts[:, None] + o_child_offset  # [32, 16]
-        
-        # mask [32, 16]
-        valid_child_mask_2d = (
-            valid_parent_mask[:, None] &  # 父节点有效
-            (o_child_offset < num_valid_children_per_parent[:, None])  # 子节点在范围内
-        )
-        
-        scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], float('-inf'), dtype=tl.float32)
-        values_2d = tl.zeros([PARENTS_PER_BATCH, COMPRESSION_RATE, V], dtype=tl.float32)
-        
-        for i_p in tl.static_range(PARENTS_PER_BATCH):
-            parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
-            
-            if parent_idx >= 0:
-                child_start = parent_idx * COMPRESSION_RATE
-                rope_pos_start = i_batch * BC + i_p * COMPRESSION_RATE
-                
-                # 使用 mask 从 valid_child_mask_2d 中提取当前父节点的子节点 mask
-                # valid_child_mask_2d: [32, 16]
-                # 创建选择第 i_p 行的 mask
-                row_selector = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)  # [32, 1]
-                # 提取第 i_p 行: 将非目标行置0，然后沿 axis=0 求和得到 [16]
-                current_parent_mask = tl.sum(
-                    tl.where(row_selector, valid_child_mask_2d.to(tl.int32), 0),
-                    axis=0
-                ).to(tl.int1)  # [16]
-                num_valid_children = tl.sum(current_parent_mask.to(tl.int32))
-                
-                # 加载 Key 并应用 RoPE
-                k_rope_1, k_rope_2 = load_k_with_rope(
-                    layer_k, cos_cache, sin_cache,
-                    i_b, i_h, child_start, rope_pos_start,
-                    N_layer, H, K, COMPRESSION_RATE, num_valid_children
-                )
-                
-                scores_16 = tl.sum(q_rope_1[None, :] * k_rope_1, axis=1) + \
-                           tl.sum(q_rope_2[None, :] * k_rope_2, axis=1)
-                v_vals = load_v(
-                    layer_v, i_b, i_h, child_start,
-                    N_layer, H, V, COMPRESSION_RATE
-                )
-                
-                # 使用外层计算的统一 mask 填充 scores_2d 和 values_2d
-                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
-                scores_2d = tl.where(
-                    is_current_parent & valid_child_mask_2d,
-                    scores_16[None, :],
-                    scores_2d
-                )
-                values_2d = tl.where(
-                    is_current_parent[:, :, None] & 
-                    valid_child_mask_2d[:, :, None] &
-                    (tl.arange(0, V)[None, None, :] < V),
-                    v_vals[None, :, :],
-                    values_2d
-                )
-        
-        # Flatten 到 [BC] = [512]
-        batch_scores = tl.reshape(scores_2d, [BC])
-        batch_values = tl.reshape(values_2d, [BC, V])
-        
-        # 应用 mask
-        valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
-        batch_scores = tl.where(valid_child_mask_flat, batch_scores, float('-inf'))
-        
-        # 显式地将无效节点的 Value 置零，避免累积错误数据
-        batch_values = tl.where(valid_child_mask_flat[:, None], batch_values, 0.0)
-        
-        # 保存当前批次的 scores 和 values 用于调试
-        if i_batch < max_batches:
-            # 存储 batch_scores: [B, T, H, max_batches, BC]
-            debug_scores_offset = i_b * T * H * max_batches * BC + i_t * H * max_batches * BC + i_h * max_batches * BC + i_batch * BC
-            o_bc = tl.arange(0, BC)
-            debug_scores_ptrs = debug_scores_batches + debug_scores_offset + o_bc
-            tl.store(debug_scores_ptrs, batch_scores)
-            
-            # 存储 batch_values: [B, T, H, max_batches, BC, V]
-            # 使用 2D 索引访问，符合 Triton 规范
-            debug_values_offset = i_b * T * H * max_batches * BC * V + i_t * H * max_batches * BC * V + i_h * max_batches * BC * V + i_batch * BC * V
-            o_bc_2d = tl.arange(0, BC)[:, None]  # [BC, 1]
-            o_v = tl.arange(0, V)  # [V]
-            
-            # 使用 where 和 sum 来选择数据
-            # batch_values: [BC, V]
-            for i_bc in tl.static_range(BC):
-                # 创建 mask 选择第 i_bc 行
-                row_mask = (o_bc_2d == i_bc)  # [BC, 1]
-                # 从 batch_values 中提取第 i_bc 行: [V]
-                selected_row = tl.sum(tl.where(row_mask, batch_values, 0.0), axis=0)  # [V]
-                # 存储
-                debug_v_ptrs = debug_values_batches + debug_values_offset + i_bc * V + o_v
-                tl.store(debug_v_ptrs, selected_row, mask=o_v < V)
-        
-        # Online Softmax
-        new_max = tl.maximum(cur_max, tl.max(batch_scores))
-        scale_old = tl.exp(cur_max - new_max)
-        scale_batch = tl.exp(batch_scores - new_max)
-        
-        cur_sum = cur_sum * scale_old + tl.sum(scale_batch)
-        cur_output = cur_output * scale_old + tl.sum(scale_batch[:, None] * batch_values, axis=0)
-        cur_max = new_max
-    
-    # 存储当前层状态
-    state_offset = i_b * T * H + i_t * H + i_h
-    tl.store(layer_max + state_offset, cur_max)
-    tl.store(layer_sum + state_offset, cur_sum)
-    
-    output_offset = i_b * T * H * V + i_t * H * V + i_h * V
-    o_v = tl.arange(0, V)
-    output_ptrs = layer_output + output_offset + o_v
-    tl.store(output_ptrs, cur_output, mask=o_v < V)
-
