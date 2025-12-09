@@ -20,9 +20,10 @@ def test_all_positions():
     # 测试配置
     B, T, H, K, V = 1, 20000, 1, 8, 8
     
-    q = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
-    k = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
-    v = torch.randn(B, T, H, V, device=device, dtype=torch.float16).contiguous()
+    # 使用 float32，保证 naive 与 triton 输入一致
+    q = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
+    k = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
+    v = torch.randn(B, T, H, V, device=device, dtype=torch.float32).contiguous()
 
     compression_rate = 16
     max_top_nodes = 8192
@@ -43,7 +44,7 @@ def test_all_positions():
     print("运行 naive 实现...")
     try:
         output_naive = naive_forward(
-            q.float(), k.float(), v.float(),
+            q, k, v,
             query_positions=query_positions,
             compression_rate=compression_rate,
             max_top_nodes=max_top_nodes,

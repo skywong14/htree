@@ -3,7 +3,7 @@ unit_tests_parallel/
 src/__pycache__/
 old_versions/
 old_doc/
-reference_nsa/
+reference_implement/
 __pycache__/
 *debug*.py
 *.nsys-rep

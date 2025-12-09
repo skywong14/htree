@@ -1,14 +1,17 @@
 """
-测试全部位置的 naive 和 parallel2 实现对比
+测试全部位置的 naive_stable_topk 和 parallel2_stable_topk 实现对比
 
 配置: B=1, T=12000, H=1, K=8, V=8
 测试所有位置，简化日志输出
+
+该测试用于验证 Bit-Packing Top-K 优化后的正确性
+两个实现都使用 Bit-Packing Top-K 技术，确保结果一致
 """
 
 import sys
 import torch
-from src.parallel2 import htree_forward_v2
-from src.naive import forward_kernel as naive_forward
+from src.parallel2_stable_topk import htree_forward_v2
+from src.naive_stable_topk import forward_kernel as naive_forward
 
 
 def test_all_positions():
@@ -20,7 +23,7 @@ def test_all_positions():
     # 测试配置
     B, T, H, K, V = 1, 20000, 1, 8, 8
     
-    # 使用 float32，保证 naive 与 triton 输入一致
+    # 使用 float32，确保 naive 与 triton 输入精度一致
     q = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
     k = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
     v = torch.randn(B, T, H, V, device=device, dtype=torch.float32).contiguous()
@@ -31,7 +34,7 @@ def test_all_positions():
     scale = K ** -0.5
     
     print("\n" + "="*80)
-    print(f"全位置对比测试配置: B={B}, T={T}, H={H}, K={K}, V={V}")
+    print(f"全位置对比测试配置 (Bit-Packing Stable TopK): B={B}, T={T}, H={H}, K={K}, V={V}")
     print(f"compression_rate={compression_rate}, top_k_per_layer={top_k_per_layer}")
     print(f"scale={scale}")
     print("="*80 + "\n")
@@ -40,8 +43,8 @@ def test_all_positions():
     test_positions = list(range(T))
     query_positions = torch.tensor([test_positions], device=device).expand(B, -1)
     
-    # Naive 实现
-    print("运行 naive 实现...")
+    # Naive Stable TopK 实现 (Bit-Packing 优化版)
+    print("运行 naive_stable_topk 实现 (Bit-Packing 优化版)...")
     try:
         output_naive = naive_forward(
             q, k, v,
@@ -51,13 +54,13 @@ def test_all_positions():
             top_k_per_layer=top_k_per_layer,
             scale=scale
         )
-        print(f"✓ Naive forward 完成: output shape {output_naive.shape}\n")
+        print(f"✓ Naive Stable TopK forward 完成: output shape {output_naive.shape}\n")
     except Exception as e:
-        print(f"✗ Naive forward 失败: {e}")
+        print(f"✗ Naive Stable TopK forward 失败: {e}")
         raise
     
-    # Parallel2 实现
-    print("运行 Parallel2 实现...")
+    # Parallel2 Stable TopK 实现 (Bit-Packing 优化版)
+    print("运行 Parallel2 Stable TopK 实现 (Bit-Packing 优化版)...")
     try:
         output_triton = htree_forward_v2(
             q, k, v,
@@ -66,9 +69,9 @@ def test_all_positions():
             top_k_per_layer=top_k_per_layer,
             scale=scale,
         )
-        print(f"✓ Parallel2 forward 完成: output shape {output_triton.shape}\n")
+        print(f"✓ Parallel2 Stable TopK forward 完成: output shape {output_triton.shape}\n")
     except Exception as e:
-        print(f"✗ Parallel2 forward 失败: {e}")
+        print(f"✗ Parallel2 Stable TopK forward 失败: {e}")
         raise
     
     # 误差分析
@@ -178,8 +181,8 @@ def test_all_positions():
             print(f"位置 {fail_info['pos']}:")
             print(f"  max_abs={fail_info['max_abs']:.6f}, mean_abs={fail_info['mean_abs']:.6f}")
             print(f"  max_rel={fail_info['max_rel']:.6f}, mean_rel={fail_info['mean_rel']:.6f}")
-            print(f"  Naive:    {fail_info['naive']}")
-            print(f"  Parallel2: {fail_info['triton']}")
+            print(f"  Naive_StableTopK:     {fail_info['naive']}")
+            print(f"  Parallel2_StableTopK: {fail_info['triton']}")
             print()
     else:
         print(f"\n✓ 所有{T}个位置测试通过!")
@@ -198,5 +201,3 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
-

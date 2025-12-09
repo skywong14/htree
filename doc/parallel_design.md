@@ -2,41 +2,41 @@
 
 ## 整体架构
 
-htree 的 Triton 实现采用三阶段流水线架构：
+htree 的 Triton 实现（`parallel2_stable_topk.py`）采用三阶段流水线架构：
 
 ```
 Phase 1: 树构建              Phase 2: 逐层前向传播              Phase 3: 最终归一化
-(htree_build_kernel)         (3个子kernel每层调用)           (htree_final_normalize_kernel)
+(htree_build_kernel_v2)      (3个子kernel每层调用)           (htree_final_normalize_kernel_v2)
    
 Token Layer                 ┌────────────────────────┐
-      ↓                     │ htree_compute_and_     │
-  Mean Pooling              │   select_kernel        │         normalized_output
-      ↓                     │ htree_subtract_topk_   │              ↑
-Layer 1, 2, ..., L          │   kernel               │         output / sum
+      ↓                     │ htree_compute_scores_  │
+  Mean Pooling              │   and_select_kernel    │         normalized_output
+      ↓                     │ htree_accumulate_      │              ↑
+Layer 1, 2, ..., L          │   non_topk_kernel      │         output / sum
   (递归构建)                 │ htree_merge_to_global_ │
-                            │   kernel               │
+                            │   kernel_v2            │
                             │  (顶层 → 底层逐层)      │
                             └────────────────────────┘
 ```
 
 **核心设计理念**：
 - **在线 Softmax 算法**：边计算边合并，避免缓存所有候选节点
-- **父节点紧凑表示**：512 个父节点索引 × 16 子节点 = 8192 候选节点
+- **父节点紧凑表示**：512 个父节点索引 × 16 子节点 = 8192 候选节点（固定 buffer）
 - **32×16 分块加载**：每批 512 节点通过 32 次加载完成，最大化内存带宽
-- **Bitonic Sort Top-K**：高效选择最重要的 512 个节点
-- **三步式处理**：每层调用 3 个 kernel（选择、减法、合并）
+- **稳定 Top-K**：Bit-Packing 编码 + 单数组 bitonic 排序，保证同分可重现
+- **三步式处理**：每层调用 3 个 kernel（选择&Top-K、非 Top-K 累积、合并）
 
 ---
 
-## Kernel 1: 树构建 (htree_build_kernel)
+## Kernel 1: 树构建 (htree_build_kernel_v2)
 
 ### 功能
 通过 Mean Pooling 从子节点生成父节点的 K 和 V 表示。
 
 ### 并行策略
 ```
-Grid: (N_parent, B × H)
-每个 block 处理一个父节点
+Grid: (B × H)
+每个 block 处理一条 (batch, head) 的父节点序列，内部循环写入
 ```
 
 ### 计算流程
@@ -55,14 +55,14 @@ Grid: (N_parent, B × H)
 ## Kernel 2: 层处理（三个子 Kernel）
 
 每层需要依次调用三个 kernel 完成前向传播：
-1. **htree_compute_and_select_kernel**：候选遍历 + 在线 Softmax + Top-K 选择
-2. **htree_subtract_topk_kernel**：反向减法移除 Top-K 贡献（非底层）
-3. **htree_merge_to_global_kernel**：合并到全局状态
+1. **htree_compute_scores_and_select_kernel**：批次遍历候选 + RoPE + 写入 8192 buffer + 稳定 Top-K（非底层）
+2. **htree_accumulate_non_topk_kernel**：按批次流式累积非 Top-K（底层累积全部）
+3. **htree_merge_to_global_kernel_v2**：合并到全局状态
 
-### Kernel 2.1: htree_compute_and_select_kernel
+### Kernel 2.1: htree_compute_scores_and_select_kernel
 
 #### 功能
-遍历候选节点，计算注意力分数，在线 Softmax 累积，选择 Top-K 节点。
+批次遍历候选节点，计算分数写入固定 8192 buffer；非底层执行稳定 Top-K，输出 buffer 位置与升序节点索引。
 
 #### 并行策略
 ```
@@ -83,36 +83,24 @@ Grid: (T, B × H)
 - 分别加载 cos/sin 并应用到 Q 的前后半部分
 
 **阶段 3：批次遍历（BC=512 固定）**
-- **初始化**：`cur_max = -inf`, `cur_sum = 0`, `cur_output = 0`，Top-K 缓冲区 `b_i`, `o_i`, `b_score`
-- **外层循环**：遍历 `num_batches` 批次（每批 32 个父节点）
-- **内层循环**：`for i_p in tl.static_range(32)` 逐个处理父节点
-  - 使用辅助函数 `load_k_with_rope` 加载 16 个子节点的 K 并应用 RoPE
-  - 使用辅助函数 `load_v` 加载 16 个子节点的 V
-  - 计算注意力分数：`scores_16 = sum(q_rope × k_rope)`
-  - 将分数和 Value 放入 2D 数组 `[32, 16]`
-- **Flatten 到批次缓冲区**：`batch_scores[512]`, `batch_node_indices[512]`, `batch_values[512, V]`
-- **在线 Softmax 累积**：
-  ```
-  new_max = max(cur_max, max(batch_scores))
-  cur_sum = cur_sum × exp(cur_max - new_max) + sum(exp(batch_scores - new_max))
-  cur_output = cur_output × exp(cur_max - new_max) + sum(exp(batch_scores - new_max) × batch_values)
-  ```
-- **Top-K 选择（非底层）**：
-  - 计算重要性分数：最右侧节点 `importance = 1.0`，其他节点 `exp(score - cur_max)`
-  - 使用 Bitonic Sort 对当前批次排序
-  - 与历史 Top-K 合并（交错合并）
-  - 向量化匹配矩阵同步更新 `b_score`
+- 外层：遍历 `num_batches`（32 父 × 16 子）批次
+- 内层：`load_k_with_rope_v2` 加载 16 子节点并应用 RoPE；计算分数填充 `[32,16]`
+- Flatten 写入固定 8192 buffer：`all_scores`, `all_node_indices`
 
-**阶段 4：存储结果**
-- 存储 `layer_max`, `layer_sum`, `layer_output`
-- 存储 `topk_indices`, `topk_scores`（未排序）
+**阶段 4：稳定 Top-K（非底层）**
+- Bit-Packing 将 buffer 位置编码进 score 低位（正数取反索引，负数原值）
+- 对编码后的分数做单数组 bitonic 排序，解码得到 buffer 位置
+- 提取前 512 的 buffer 位置 `topk_positions`，并获得升序的全局节点索引 `selected_indices`
+- 最右节点在排序前被赋值 `1e3`，确保必选
+
+**底层特殊**：跳过排序，`topk_positions/selected_indices` 置为 -1。
 
 ---
 
-### Kernel 2.2: htree_subtract_topk_kernel
+### Kernel 2.2: htree_accumulate_non_topk_kernel
 
 #### 功能
-移除 Top-K 节点的贡献（反向减法），仅非底层调用。
+按原批次顺序流式加载 V，并基于 `topk_positions` 构建 mask，仅累积非 Top-K；底层累积全部。
 
 #### 并行策略
 ```
@@ -121,31 +109,24 @@ Grid: (T, B × H)
 
 #### 算法流程
 
-**步骤 1：对 Top-K 索引排序**
-- 加载 `topk_indices`（未排序）
-- 将 -1 替换为 `MAX_IDX = 2147483647`
-- 使用 Bitonic Sort 按升序排序
-- 恢复 -1 并存储到 `selected_indices`（传递给下一层）
+**步骤 1：加载元数据**
+- 读取 `num_candidates`，`topk_positions`（buffer 位置，可能包含 -1）
 
-**步骤 2：汇总 Top-K 贡献**
-- 计算 `topk_max = max(topk_scores)`（跳过无效节点）
-- 逐个加载 Top-K 节点的 Value（循环 512 次）
-- 累积到 `topk_values[512, V]`
-- 计算加权和：`topk_output = sum(exp(topk_scores - topk_max) × topk_values)`
+**步骤 2：按批次加载 V（32 父 × 16 子）**
+- 使用 `load_v_v2` 加载每批 512 个候选的 V
+- 构建 `topk_mask`（基于 buffer 位置）并与有效性联合得到最终 mask
+- 底层不使用 topk_mask
 
-**步骤 3：反向减法**
-```
-topk_scale = exp(topk_max - cur_max)
-cur_sum = cur_sum - topk_sum × topk_scale
-cur_output = cur_output - topk_output × topk_scale
-```
+**步骤 3：在线 Softmax 累积**
+- 对 masked scores 计算 block_max / block_sum / block_out
+- 与累计状态 `(cur_max, cur_sum, cur_output)` 在线合并
 
 **步骤 4：写回**
-- 更新 `layer_max`, `layer_sum`, `layer_output`
+- 存储 `layer_max`, `layer_sum`, `layer_output`
 
 ---
 
-### Kernel 2.3: htree_merge_to_global_kernel
+### Kernel 2.3: htree_merge_to_global_kernel_v2
 
 #### 功能
 将当前层状态合并到全局状态。
@@ -185,8 +166,8 @@ global_max = new_max
 - 辅助函数封装：`load_k_with_rope`, `load_v` 简化代码
 
 **数值稳定性**：
-- 在线 Softmax：动态维护 max 值
-- 反向减法：缩放后再减去
+- 在线 Softmax：动态维护 max 值；合并阶段做安全缩放
+- Top-K 跳过底层，非底层使用稳定排序保证可重现
 
 ---
 

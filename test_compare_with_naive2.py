@@ -17,7 +17,7 @@ def test_compare_with_naive():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # 测试数据
-    B, T, H, K, V = 1, 12000, 1, 8, 8
+    B, T, H, K, V = 1, 20000, 1, 8, 8
     
     q = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
     k = torch.randn(B, T, H, K, device=device, dtype=torch.float16).contiguous()
