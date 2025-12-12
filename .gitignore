@@ -5,5 +5,5 @@ old_versions/
 old_doc/
 reference_implement/
 __pycache__/
-*debug*.py
+*debug*.*
 *.nsys-rep

@@ -101,6 +101,11 @@ def bitpack_encode(scores: torch.Tensor, indices: torch.Tensor, log_n: int = 13)
     # 将 float32 视为 int32
     scores_int = scores.view(torch.int32)
     
+    # TODO
+    # 手动清空尾数的第14位（bit 13，从0开始计数）
+    # bit_13_mask = ~(1 << 13)  # 创建一个只有 bit 13 为 0 的掩码
+    # scores_int = scores_int & bit_13_mask
+    
     # 编码索引：正数取反，负数保持
     encoded_idx = torch.where(
         scores >= 0,
@@ -448,7 +453,7 @@ def compute_select_and_merge(
     # 计算注意力分数 (single head, no pooling)
     scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
     scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
-    
+
     # 确定参与在线Softmax的节点和选中的节点
     is_bottom_layer = (layer_idx == 0)
     if is_bottom_layer:
@@ -457,18 +462,35 @@ def compute_select_and_merge(
         merge_values = candidate_v  # [1, num_cand, 1, D]
         selected_indices = None
         topk_buffer_positions = None
+        # 底层不需要编码，scores_pooled_encoded 与 scores_pooled 相同
+        scores_pooled_encoded = scores_pooled
     else:
         # ================================================================
         # 非底层：使用 Bit-Packing Top-K 选择（与 Triton 实现一致）
         # ================================================================
         
-        # 使用 Bit-Packing 稳定 Top-K
+        # 将 position_id 编码到 scores_pooled 中（用于调试和可视化）
+        log_n = 13  # MAX_CANDIDATES = 8192, log2(8192) = 13
+        buffer_indices = torch.arange(num_candidates, device=device, dtype=torch.int32)
+        
+        # 给 rightmost 节点设置高分（与 Triton 一致）
+        is_rightmost = (candidate_indices == rightmost_idx)
+        scores_modified = torch.where(
+            is_rightmost,
+            torch.tensor(1e3, device=device, dtype=torch.float32),
+            scores_pooled
+        )
+        
+        # Bit-Packing 编码
+        scores_pooled_encoded = bitpack_encode(scores_modified, buffer_indices, log_n)
+
+        # 使用 Bit-Packing 稳定 Top-K（注意：这里传入编码后的分数）
         topk_buffer_positions, selected_node_indices_sorted = stable_topk_with_bitpacking(
-            scores_pooled,
+            scores_pooled,  # 内部会重新编码，所以这里还是传原始分数
             top_k,
             rightmost_idx,
             candidate_indices,
-            log_n=13  # MAX_CANDIDATES = 8192, log2(8192) = 13
+            log_n=log_n
         )
         
         # 被选中的节点掩码（基于 buffer 位置）
@@ -488,9 +510,10 @@ def compute_select_and_merge(
     max_score, sum_exp, weighted_output = online_softmax_merge(
         max_score, sum_exp, weighted_output, merge_scores, merge_values
     )
-    
+
     if return_debug_info:
-        return max_score, sum_exp, weighted_output, selected_indices, candidate_indices, scores_pooled
+        # 返回编码后的分数（包含 position_id），用于调试和可视化
+        return max_score, sum_exp, weighted_output, selected_indices, candidate_indices, scores_pooled_encoded
     else:
         return max_score, sum_exp, weighted_output, selected_indices
 

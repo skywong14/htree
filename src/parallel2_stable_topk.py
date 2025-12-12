@@ -447,6 +447,10 @@ def htree_compute_scores_and_select_kernel(
         
         # 将 float32 视为 int32 进行位操作
         buffer_scores_int = buffer_scores.to(tl.int32, bitcast=True)
+
+        # 手动清空尾数的第14位（bit 13，从0开始计数）
+        # bit_13_mask = ~(1 << 13)  # 创建一个只有 bit 13 为 0 的掩码
+        # buffer_scores_int = buffer_scores_int & bit_13_mask
         
         # 编码索引：
         # - 正数：取反索引 (~idx)，使小索引在数值相同时排在前面（稳定排序）
@@ -457,6 +461,11 @@ def htree_compute_scores_and_select_kernel(
         # 清除 float32 低 13 位，填入编码后的索引
         buffer_scores_encoded_int = (buffer_scores_int & ~idx_mask) | encoded_idx
         buffer_scores_encoded = buffer_scores_encoded_int.to(tl.float32, bitcast=True)
+        
+        # ================================================================
+        # 4.3.1 回写编码后的分数到 all_scores（用于调试）
+        # ================================================================
+        # tl.store(all_scores + buffer_base + o_buf, buffer_scores_encoded)
         
         # ================================================================
         # 4.4 排序：使用单数组 bitonic sort（索引已编码在值中）
