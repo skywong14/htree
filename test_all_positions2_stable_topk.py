@@ -9,12 +9,51 @@
 """
 
 import sys
+import argparse
 import torch
 from src.parallel2_stable_topk import htree_forward_v2
 from src.naive_stable_topk import forward_kernel as naive_forward
 
 
-def test_all_positions():
+def _cuda_sync_if_needed(device: str) -> None:
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+
+def _warmup_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    compression_rate: int,
+    max_top_nodes: int,
+    top_k_per_layer: int,
+    scale: float,
+    warmup_iters: int,
+    device: str,
+) -> None:
+    if warmup_iters <= 0:
+        return
+    if device != "cuda":
+        # Triton only runs on CUDA; keep behavior explicit.
+        return
+
+    print(f"\n[Warmup] 预热 Triton kernel: {warmup_iters} 次 ...")
+    with torch.no_grad():
+        for i in range(warmup_iters):
+            _ = htree_forward_v2(
+                q, k, v,
+                compression_rate=compression_rate,
+                max_top_nodes=max_top_nodes,
+                top_k_per_layer=top_k_per_layer,
+                scale=scale,
+            )
+            _cuda_sync_if_needed(device)
+            print(f"[Warmup] 完成 {i + 1}/{warmup_iters}")
+    print("[Warmup] Triton 预热完成。\n")
+
+
+def test_all_positions(*, warmup_triton_iters: int = 2):
     """测试所有位置的输出结果"""
     # 设置随机种子保证可重现
     torch.manual_seed(42)
@@ -58,10 +97,22 @@ def test_all_positions():
     except Exception as e:
         print(f"✗ Naive Stable TopK forward 失败: {e}")
         raise
+
+    # Triton warmup：把 JIT 编译 / cuModuleLoadData 等一次性开销赶到计时/采样外
+    _warmup_triton(
+        q, k, v,
+        compression_rate=compression_rate,
+        max_top_nodes=max_top_nodes,
+        top_k_per_layer=top_k_per_layer,
+        scale=scale,
+        warmup_iters=warmup_triton_iters,
+        device=device,
+    )
     
     # Parallel2 Stable TopK 实现 (Bit-Packing 优化版)
     print("运行 Parallel2 Stable TopK 实现 (Bit-Packing 优化版)...")
     try:
+        _cuda_sync_if_needed(device)
         output_triton = htree_forward_v2(
             q, k, v,
             compression_rate=compression_rate,
@@ -69,6 +120,7 @@ def test_all_positions():
             top_k_per_layer=top_k_per_layer,
             scale=scale,
         )
+        _cuda_sync_if_needed(device)
         print(f"✓ Parallel2 Stable TopK forward 完成: output shape {output_triton.shape}\n")
     except Exception as e:
         print(f"✗ Parallel2 Stable TopK forward 失败: {e}")
@@ -194,7 +246,16 @@ def test_all_positions():
 
 if __name__ == "__main__":
     try:
-        success = test_all_positions()
+        parser = argparse.ArgumentParser(description="All-positions correctness test for stable top-k (naive vs triton).")
+        parser.add_argument(
+            "--warmup-triton-iters",
+            type=int,
+            default=2,
+            help="Warm up triton kernels by running htree_forward_v2 N times before the real run (default: 2).",
+        )
+        args = parser.parse_args()
+
+        success = test_all_positions(warmup_triton_iters=args.warmup_triton_iters)
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n测试执行失败: {e}")

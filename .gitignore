@@ -7,3 +7,4 @@ reference_implement/
 __pycache__/
 *debug*.*
 *.nsys-rep
+.*/

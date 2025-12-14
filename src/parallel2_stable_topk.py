@@ -1,56 +1,34 @@
 # -*- coding: utf-8 -*-
 """
-htree (Hierarchical Tree for KV Cache and Sparse Attention) 的 Triton Kernel 实现 V2
+htree Triton Kernel - stable Top-K 版本（parallel2_stable_topk.py）
 
-与 parallel.py 的主要区别：
-- parallel.py:  先累积所有候选节点 → 再减去 Top-K 贡献 
-- parallel2.py: 先选出 Top-K 节点 → 只累积非 Top-K 节点 (与 naive 一致)
 
-===============================================================================
+Pipeline
+  Phase 1: Tree Building (htree_build_kernel_v2)
+    - 逐层 mean pooling 构建树
 
-Phase 1: Tree Building (与 parallel.py 相同)
-  - 逐层 mean pooling 构建层次结构
+  Phase 2: Forward (top → bottom)
+    - Kernel 2.1 compute_scores_and_select:
+        · 32 父 × 16 子批次遍历，RoPE 后写入固定 8192 buffer (scores & indices)
+        · 非底层：将最右节点分数置 1e3，Bit-Packing 编码 buffer 位置并做单数组 bitonic 排序 → 稳定 Top-K
+        · 底层跳过排序，topk_positions/selected_indices 置 -1
+    - Kernel 2.2 accumulate_non_topk:
+        · 按原批次顺序流式加载 V，基于 topk_positions 构建 mask，仅累积非 Top-K；底层累积全部
+    - Kernel 2.3 merge_to_global_v2:
+        · 在线 Softmax 合并当前层累计到全局状态
 
-Phase 2: Forward Pass (逐层处理，从顶层到底层)
-
-  【Kernel 2.1: Compute Scores & Select Top-K】
-  输入:  q, layer_k, prev_selected_parents, cos_cache, sin_cache
-  处理:
-    1. 批次遍历候选节点（32父×16子=512/批）
-    2. 计算 attention scores（Q @ K^T with RoPE）
-    3. 存储到固定 8192 buffer: all_scores[8192], all_node_indices[8192]
-    4. 非底层: 给 rightmost 节点 score 置为 1e3，按 score 降序排序选 Top-512
-    5. Top-512 的全局索引升序排序后传给下一层
-    6. 底层: 跳过排序
-  输出:  all_scores, all_node_indices, topk_positions, selected_indices
-
-    【Kernel 2.2: Accumulate Non-TopK】
-    输入:  layer_v, all_scores, num_candidates, topk_positions
-  处理:
-    1. 按原批次顺序加载 V（每批 16 个连续）
-    2. 创建 Top-K mask（标记 buffer 中 Top-512 的位置）
-    3. 最终 mask = valid_mask & (~topk_mask)
-    4. 对非 Top-K 候选节点进行 online softmax 累积
-    5. 底层: 累积所有候选节点（无 Top-K mask）
-  输出:  layer_max, layer_sum, layer_output
-
-  【Kernel 2.3: Merge to Global】(与 parallel.py 相同)
-    - 在线 Softmax 合并: (global_state, layer_state) → global_state
-
-Phase 3: Final Normalization
-  - output = global_output / global_sum
-
-===============================================================================
+  Phase 3: Final Normalize (htree_final_normalize_kernel_v2)
+    - output = global_output / global_sum
 """
 
-from typing import Optional
+from typing import Optional, Dict, Tuple
 import torch
 import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
 
 # ==========================================
-# Kernel 1: Tree Building (复用 parallel.py)
+# Kernel 1: Tree Building
 # ==========================================
 
 @triton.jit
@@ -148,7 +126,7 @@ def htree_build_kernel_v2(
 
 
 # ==========================================
-# 辅助函数 (复用 parallel.py)
+# 辅助函数
 # ==========================================
 
 @triton.jit
@@ -238,6 +216,15 @@ def load_v_v2(
 # Kernel 2.1: Compute Scores & Select Top-K
 # ==========================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=['B', 'H', 'K']
+)
 @triton.jit
 def htree_compute_scores_and_select_kernel(
     q,  # [B, T, H, K]
@@ -447,10 +434,6 @@ def htree_compute_scores_and_select_kernel(
         
         # 将 float32 视为 int32 进行位操作
         buffer_scores_int = buffer_scores.to(tl.int32, bitcast=True)
-
-        # 手动清空尾数的第14位（bit 13，从0开始计数）
-        # bit_13_mask = ~(1 << 13)  # 创建一个只有 bit 13 为 0 的掩码
-        # buffer_scores_int = buffer_scores_int & bit_13_mask
         
         # 编码索引：
         # - 正数：取反索引 (~idx)，使小索引在数值相同时排在前面（稳定排序）
@@ -461,11 +444,6 @@ def htree_compute_scores_and_select_kernel(
         # 清除 float32 低 13 位，填入编码后的索引
         buffer_scores_encoded_int = (buffer_scores_int & ~idx_mask) | encoded_idx
         buffer_scores_encoded = buffer_scores_encoded_int.to(tl.float32, bitcast=True)
-        
-        # ================================================================
-        # 4.3.1 回写编码后的分数到 all_scores（用于调试）
-        # ================================================================
-        # tl.store(all_scores + buffer_base + o_buf, buffer_scores_encoded)
         
         # ================================================================
         # 4.4 排序：使用单数组 bitonic sort（索引已编码在值中）
@@ -559,6 +537,15 @@ def htree_compute_scores_and_select_kernel(
 # Kernel 2.2: Accumulate Non-TopK (批次加载 V)
 # ==========================================
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+    ],
+    key=['B', 'H', 'K']
+)
 @triton.jit
 def htree_accumulate_non_topk_kernel(
     layer_v,  # [B, N_layer, H, V]
@@ -610,35 +597,13 @@ def htree_accumulate_non_topk_kernel(
     buffer_base = i_b * T * H * MAX_CANDIDATES + i_t * H * MAX_CANDIDATES + i_h * MAX_CANDIDATES
     
     # ========================================
-    # 阶段 2: 创建 Top-K mask（在 8192 buffer 中）
-    # ========================================
-    
-    # 根据 topk_pos_vals 创建 mask，标记 buffer 中 Top-K 的位置
-    o_buf = tl.arange(0, MAX_CANDIDATES)
-    
-    topk_mask = tl.zeros([MAX_CANDIDATES], dtype=tl.int1)
-    TOPK_CHUNK: tl.constexpr = 128
-    NUM_TOPK_CHUNKS: tl.constexpr = (TOP_K + TOPK_CHUNK - 1) // TOPK_CHUNK
-
-    for chunk_idx in range(NUM_TOPK_CHUNKS):
-        chunk_start = chunk_idx * TOPK_CHUNK
-        o_chunk = chunk_start + tl.arange(0, TOPK_CHUNK)
-        chunk_pos = tl.load(
-            topk_positions + topk_offset + o_chunk,
-            mask=o_chunk < TOP_K,
-            other=-1,
-        )
-        # 块级广播比较，生成命中标记
-        chunk_match = (o_buf[:, None] == chunk_pos[None, :])
-        chunk_hit = tl.sum(chunk_match, axis=1).to(tl.int1)
-        topk_mask = topk_mask | chunk_hit
-    
-    # ========================================
     # 阶段 3: 批次加载 V（按原顺序，每批 16 个）
     # ========================================
     
-    # 创建 all_values buffer
-    all_values = tl.zeros([MAX_CANDIDATES, V], dtype=tl.float32)
+    # 逐批在线累计，避免物化全量 all_values
+    cur_max = tl.full((), -1e10, dtype=tl.float32)
+    cur_sum = tl.zeros((), dtype=tl.float32)
+    cur_output = tl.zeros([V], dtype=tl.float32)
     
     prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
@@ -704,55 +669,48 @@ def htree_accumulate_non_topk_kernel(
         batch_values = tl.reshape(values_2d, [BC, V])
         valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
         
-        # 应用 mask
-        batch_values = tl.where(valid_child_mask_flat[:, None], batch_values, 0.0)
-        
-        # 存储到 all_values buffer
+        # 当前批次的全局 buffer 偏移
         buffer_offset = i_batch * BC
+        o_bc = tl.arange(0, BC)
+        global_pos = buffer_offset + o_bc
         
-        for i_bc in range(BC):
-            store_pos = buffer_offset + i_bc
-            if store_pos < MAX_CANDIDATES:
-                # 提取第 i_bc 行
-                row_mask = (tl.arange(0, BC)[:, None] == i_bc)
-                selected_row = tl.sum(tl.where(row_mask, batch_values, 0.0), axis=0)
-                
-                # 存储到 all_values[store_pos, :]
-                store_mask_2d = (o_buf[:, None] == store_pos) & (tl.arange(0, V)[None, :] < V)
-                all_values = tl.where(store_mask_2d, selected_row[None, :], all_values)
+        # 候选有效性（不超过实际候选数且父子存在）
+        valid_mask = valid_child_mask_flat & (global_pos < n_cand)
+        
+        # 非底层则剔除 top-k
+        if not is_bottom_layer:
+            # 检测当前批次位置是否命中 Top-K（与 topk_pos_vals 逐元素比较）
+            topk_hit = tl.sum(global_pos[:, None] == topk_pos_vals[None, :], axis=1).to(tl.int1)
+            final_mask = valid_mask & (~topk_hit)
+        else:
+            final_mask = valid_mask
+        
+        # 加载 scores
+        batch_scores = tl.load(all_scores + buffer_base + buffer_offset + o_bc, mask=o_bc < BC, other=-1e10)
+        masked_scores = tl.where(final_mask, batch_scores, -1e10)
+        masked_values = tl.where(final_mask[:, None], batch_values, 0.0)
+        
+        # 计算本批次 softmax 分子
+        block_max = tl.max(masked_scores)
+        exp_scores = tl.exp(masked_scores - block_max)
+        exp_scores = tl.where(final_mask, exp_scores, 0.0)
+        block_sum = tl.sum(exp_scores)
+        block_out = tl.sum(exp_scores[:, None] * masked_values, axis=0)
+        
+        # 与累计状态合并（online softmax 合并）
+        has_block = block_sum > 0
+        new_max = tl.maximum(cur_max, block_max)
+        scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
+        scale_blk = tl.where(has_block, tl.exp(block_max - new_max), 0.0)
+        merged_sum = cur_sum * scale_cur + block_sum * scale_blk
+        merged_out = cur_output * scale_cur + block_out * scale_blk
+        
+        cur_max = tl.where(has_block | (cur_sum > 0), new_max, cur_max)
+        cur_sum = tl.where(has_block | (cur_sum > 0), merged_sum, cur_sum)
+        cur_output = tl.where(has_block | (cur_sum > 0), merged_out, cur_output)
 
     # ========================================
-    # 阶段 4: 加载 scores 并应用 mask
-    # ========================================
-    
-    buffer_scores = tl.load(all_scores + buffer_base + o_buf)
-    
-    # 有效候选节点 mask
-    valid_mask = o_buf < n_cand
-    
-    # 最终 mask：有效 且 非 top-k
-    if not is_bottom_layer:
-        final_mask = valid_mask & (~topk_mask)
-    else:
-        final_mask = valid_mask
-    
-    masked_scores = tl.where(final_mask, buffer_scores, -1e10)
-    masked_values = tl.where(final_mask[:, None], all_values, 0.0)
-    
-    # ========================================
-    # 阶段 5: Online Softmax 累积
-    # ========================================
-    
-    cur_max = tl.max(masked_scores)
-    
-    exp_scores = tl.exp(masked_scores - cur_max)
-    exp_scores = tl.where(final_mask, exp_scores, 0.0)
-    
-    cur_sum = tl.sum(exp_scores)
-    cur_output = tl.sum(exp_scores[:, None] * masked_values, axis=0)
-    
-    # ========================================
-    # 阶段 6: 存储结果
+    # 阶段 4: 存储结果
     # ========================================
     
     state_offset = i_b * T * H + i_t * H + i_h
@@ -765,7 +723,7 @@ def htree_accumulate_non_topk_kernel(
 
 
 # ==========================================
-# Kernel 2.3 & Final Normalization (复用 parallel.py)
+# Kernel 2.3 & Final Normalization
 # ==========================================
 
 @triton.jit
@@ -869,7 +827,7 @@ def htree_final_normalize_kernel_v2(
 
 
 # ==========================================
-# 排序辅助函数 (Bit-Packing Top-K 优化版)
+# 排序辅助函数 (Bit-Packing Top-K)
 # ==========================================
 
 # -------------------- 单数组排序 (用于 Bit-Packing) --------------------
@@ -933,7 +891,7 @@ def sort_single(
     return x
 
 
-# -------------------- 双数组排序 (保留用于 selected_indices 升序排序) --------------------
+# -------------------- 双数组排序 (用于 selected_indices 升序排序) --------------------
 
 @triton.jit
 def _compare_and_swap_v2(
@@ -1154,6 +1112,12 @@ def htree_forward_v2(
         # Kernel 2.1: Compute Scores & Select Top-K
         nvtx.range_push("K2.1_ComputeScoresAndSelect")
         print("    Running compute scores and select kernel...")
+        
+        torch.cuda.synchronize()
+        start_k21 = torch.cuda.Event(enable_timing=True)
+        end_k21 = torch.cuda.Event(enable_timing=True)
+        start_k21.record()
+        
         htree_compute_scores_and_select_kernel[grid](
             q, k_layer,
             prev_selected_parents,
@@ -1168,11 +1132,22 @@ def htree_forward_v2(
             MAX_CANDIDATES=MAX_CANDIDATES,
             scale=scale,
         )
+        end_k21.record()
+        torch.cuda.synchronize()
+        time_k21 = start_k21.elapsed_time(end_k21)
+        print(f"      Kernel 2.1 time: {time_k21:.2f} ms")
+        
         nvtx.range_pop()
         
         # Kernel 2.2: Accumulate Non-TopK
         nvtx.range_push("K2.2_AccumulateNonTopK")
         print("    Running accumulate non-topk kernel...")
+        
+        torch.cuda.synchronize()
+        start_k22 = torch.cuda.Event(enable_timing=True)
+        end_k22 = torch.cuda.Event(enable_timing=True)
+        start_k22.record()
+        
         htree_accumulate_non_topk_kernel[grid](
             v_layer,
             prev_selected_parents,
@@ -1186,16 +1161,32 @@ def htree_forward_v2(
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,
         )
+        end_k22.record()
+        torch.cuda.synchronize()
+        time_k22 = start_k22.elapsed_time(end_k22)
+        print(f"      Kernel 2.2 time: {time_k22:.2f} ms")
+        
         nvtx.range_pop()
         
         # Kernel 2.3: Merge to Global State
         nvtx.range_push("K2.3_MergeToGlobal")
         print("    Running merge to global kernel...")
+        
+        torch.cuda.synchronize()
+        start_k23 = torch.cuda.Event(enable_timing=True)
+        end_k23 = torch.cuda.Event(enable_timing=True)
+        start_k23.record()
+        
         htree_merge_to_global_kernel_v2[grid](
             layer_max, layer_sum, layer_output,
             global_max, global_sum, global_output,
             B=B, T=T, H=H, V=V,
         )
+        end_k23.record()
+        torch.cuda.synchronize()
+        time_k23 = start_k23.elapsed_time(end_k23)
+        print(f"      Kernel 2.3 time: {time_k23:.2f} ms")
+        
         nvtx.range_pop()
 
         # 更新 parent indices
@@ -1211,10 +1202,21 @@ def htree_forward_v2(
     
     output = torch.empty(B, T, H, V, dtype=dtype, device=device)
     grid = (T, B * H)
+    
+    torch.cuda.synchronize()
+    start_k4 = torch.cuda.Event(enable_timing=True)
+    end_k4 = torch.cuda.Event(enable_timing=True)
+    start_k4.record()
+    
     htree_final_normalize_kernel_v2[grid](
         global_output, global_sum, output,
         B=B, T=T, H=H, V=V,
     )
+    end_k4.record()
+    torch.cuda.synchronize()
+    time_k4 = start_k4.elapsed_time(end_k4)
+    print(f"  Final Normalization Kernel time: {time_k4:.2f} ms")
+    
     nvtx.range_pop()
 
     print("htree forward pass V2 completed!")
