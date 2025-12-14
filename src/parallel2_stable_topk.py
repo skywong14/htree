@@ -216,15 +216,15 @@ def load_v_v2(
 # Kernel 2.1: Compute Scores & Select Top-K
 # ==========================================
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=3),
-    ],
-    key=['B', 'H', 'K']
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=4, num_stages=2),
+#         triton.Config({}, num_warps=8, num_stages=2),
+#         triton.Config({}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=8, num_stages=3),
+#     ],
+#     key=['B', 'H', 'K']
+# )
 @triton.jit
 def htree_compute_scores_and_select_kernel(
     q,  # [B, T, H, K]
@@ -537,15 +537,15 @@ def htree_compute_scores_and_select_kernel(
 # Kernel 2.2: Accumulate Non-TopK (批次加载 V)
 # ==========================================
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=3),
-    ],
-    key=['B', 'H', 'K']
-)
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=4, num_stages=2),
+#         triton.Config({}, num_warps=8, num_stages=2),
+#         triton.Config({}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=8, num_stages=3),
+#     ],
+#     key=['B', 'H', 'K']
+# )
 @triton.jit
 def htree_accumulate_non_topk_kernel(
     layer_v,  # [B, N_layer, H, V]
@@ -569,7 +569,7 @@ def htree_accumulate_non_topk_kernel(
     MAX_CANDIDATES: tl.constexpr,
 ):
     """
-    Kernel 2.2: 批次加载 V，累积非 Top-K 节点
+    Kernel 2.2: 流式加载 V，累积非 Top-K 节点（Stream Accumulate）
     Grid: (T, B*H)
     """
     i_t = tl.program_id(0)
@@ -597,117 +597,94 @@ def htree_accumulate_non_topk_kernel(
     buffer_base = i_b * T * H * MAX_CANDIDATES + i_t * H * MAX_CANDIDATES + i_h * MAX_CANDIDATES
     
     # ========================================
-    # 阶段 3: 批次加载 V（按原顺序，每批 16 个）
+    # 阶段 3: 流式加载 V 并累积（Stream Accumulate）
     # ========================================
     
-    # 逐批在线累计，避免物化全量 all_values
+    # 逐父节点在线累计，避免物化全量 values_2d [32, 16, V]
     cur_max = tl.full((), -1e10, dtype=tl.float32)
     cur_sum = tl.zeros((), dtype=tl.float32)
     cur_output = tl.zeros([V], dtype=tl.float32)
     
     prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
-    valid_mask = parent_list >= 0
-    num_valid_parents = tl.sum(valid_mask.to(tl.int32))
+    valid_parent_list_mask = parent_list >= 0
+    num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
     num_batches = (num_valid_parents + 31) // 32
 
     for i_batch in range(num_batches):
-        # 加载 32 个父节点索引
-        o_parent_local = tl.arange(0, PARENTS_PER_BATCH)
-        parent_indices = tl.load(
-            prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + o_parent_local,
-            mask=o_parent_local < PARENTS_PER_BATCH,
-            other=-1
-        )
-        
-        valid_parent_mask = parent_indices >= 0
-        child_starts = parent_indices * COMPRESSION_RATE
-        child_starts = tl.where(valid_parent_mask, child_starts, 0)
-        
-        # 判断最右侧父节点（用于 padding）
-        is_rightmost_parent = (child_starts // COMPRESSION_RATE == rightmost_idx // COMPRESSION_RATE)
-        num_valid_children_per_parent = tl.where(
-            is_rightmost_parent,
-            (rightmost_idx % COMPRESSION_RATE) + 1,
-            COMPRESSION_RATE
-        )
-        
-        # 构建 2D mask [32, 16]
-        o_child_offset = tl.arange(0, COMPRESSION_RATE)[None, :]
-        valid_child_mask_2d = (
-            valid_parent_mask[:, None] &
-            (o_child_offset < num_valid_children_per_parent[:, None])
-        )
-        
-        # 初始化当前批次的 values
-        values_2d = tl.zeros([PARENTS_PER_BATCH, COMPRESSION_RATE, V], dtype=tl.float32)
-        
-        # 遍历 32 个父节点，加载 V
+        # ========================================
+        # Stream Accumulate: 逐父节点流式累积
+        # ========================================
+        # 遍历当前批次的 32 个父节点，逐个处理
         for i_p in tl.static_range(PARENTS_PER_BATCH):
+            # 加载当前父节点索引
             parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
             
+            # 检查父节点有效性
             if parent_idx >= 0:
                 child_start = parent_idx * COMPRESSION_RATE
                 
-                # 加载 V [16, V]
+                # 加载当前父节点的 V values [16, V]
                 v_vals = load_v_v2(
                     layer_v, i_b, i_h, child_start,
                     N_layer, H, V, COMPRESSION_RATE
                 )
                 
-                # 填充到 2D 结果
-                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
-                values_2d = tl.where(
-                    is_current_parent[:, :, None] & 
-                    valid_child_mask_2d[:, :, None] &
-                    (tl.arange(0, V)[None, None, :] < V),
-                    v_vals[None, :, :],
-                    values_2d
+                # 计算当前父节点的有效子节点数
+                is_rightmost = (parent_idx == rightmost_idx // COMPRESSION_RATE)
+                num_valid_children = tl.where(
+                    is_rightmost,
+                    (rightmost_idx % COMPRESSION_RATE) + 1,
+                    COMPRESSION_RATE
                 )
-        
-        # Flatten 到 [BC, V]
-        batch_values = tl.reshape(values_2d, [BC, V])
-        valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
-        
-        # 当前批次的全局 buffer 偏移
-        buffer_offset = i_batch * BC
-        o_bc = tl.arange(0, BC)
-        global_pos = buffer_offset + o_bc
-        
-        # 候选有效性（不超过实际候选数且父子存在）
-        valid_mask = valid_child_mask_flat & (global_pos < n_cand)
-        
-        # 非底层则剔除 top-k
-        if not is_bottom_layer:
-            # 检测当前批次位置是否命中 Top-K（与 topk_pos_vals 逐元素比较）
-            topk_hit = tl.sum(global_pos[:, None] == topk_pos_vals[None, :], axis=1).to(tl.int1)
-            final_mask = valid_mask & (~topk_hit)
-        else:
-            final_mask = valid_mask
-        
-        # 加载 scores
-        batch_scores = tl.load(all_scores + buffer_base + buffer_offset + o_bc, mask=o_bc < BC, other=-1e10)
-        masked_scores = tl.where(final_mask, batch_scores, -1e10)
-        masked_values = tl.where(final_mask[:, None], batch_values, 0.0)
-        
-        # 计算本批次 softmax 分子
-        block_max = tl.max(masked_scores)
-        exp_scores = tl.exp(masked_scores - block_max)
-        exp_scores = tl.where(final_mask, exp_scores, 0.0)
-        block_sum = tl.sum(exp_scores)
-        block_out = tl.sum(exp_scores[:, None] * masked_values, axis=0)
-        
-        # 与累计状态合并（online softmax 合并）
-        has_block = block_sum > 0
-        new_max = tl.maximum(cur_max, block_max)
-        scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
-        scale_blk = tl.where(has_block, tl.exp(block_max - new_max), 0.0)
-        merged_sum = cur_sum * scale_cur + block_sum * scale_blk
-        merged_out = cur_output * scale_cur + block_out * scale_blk
-        
-        cur_max = tl.where(has_block | (cur_sum > 0), new_max, cur_max)
-        cur_sum = tl.where(has_block | (cur_sum > 0), merged_sum, cur_sum)
-        cur_output = tl.where(has_block | (cur_sum > 0), merged_out, cur_output)
+                
+                # 构建子节点有效性 mask [16]
+                o_child = tl.arange(0, COMPRESSION_RATE)
+                child_valid_mask = o_child < num_valid_children
+                
+                # 计算全局位置（在 buffer 中的位置）
+                global_pos_base = i_batch * BC + i_p * COMPRESSION_RATE
+                global_pos = global_pos_base + o_child
+                
+                # 候选有效性（不超过实际候选数且子节点有效）
+                child_candidate_mask = child_valid_mask & (global_pos < n_cand)
+                
+                # 非底层则剔除 top-k
+                if not is_bottom_layer:
+                    # 检测当前子节点位置是否命中 Top-K
+                    topk_hit = tl.sum(global_pos[:, None] == topk_pos_vals[None, :], axis=1).to(tl.int1)
+                    final_child_mask = child_candidate_mask & (~topk_hit)
+                else:
+                    final_child_mask = child_candidate_mask
+                
+                # 加载当前子节点的 scores [16]
+                child_scores = tl.load(
+                    all_scores + buffer_base + global_pos,
+                    mask=o_child < COMPRESSION_RATE,
+                    other=-1e10
+                )
+                
+                # 应用 mask
+                masked_scores = tl.where(final_child_mask, child_scores, -1e10)
+                masked_values = tl.where(final_child_mask[:, None], v_vals, 0.0)
+                
+                # 计算当前父节点的 softmax 分子
+                parent_max = tl.max(masked_scores)
+                exp_scores = tl.exp(masked_scores - parent_max)
+                exp_scores = tl.where(final_child_mask, exp_scores, 0.0)
+                parent_sum = tl.sum(exp_scores)
+                parent_out = tl.sum(exp_scores[:, None] * masked_values, axis=0)
+                
+                # 与累计状态合并（online softmax）
+                has_contribution = parent_sum > 0
+                if has_contribution:
+                    new_max = tl.maximum(cur_max, parent_max)
+                    scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
+                    scale_parent = tl.exp(parent_max - new_max)
+                    
+                    cur_sum = cur_sum * scale_cur + parent_sum * scale_parent
+                    cur_output = cur_output * scale_cur + parent_out * scale_parent
+                    cur_max = new_max
 
     # ========================================
     # 阶段 4: 存储结果
