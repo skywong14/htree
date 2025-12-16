@@ -305,10 +305,19 @@ def htree_compute_scores_and_select_kernel(
     q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
     
     # ========================================
-    # 阶段 3: 批次遍历，加载 K 并计算 scores
+    # 阶段 3: 批次遍历，加载 K 并计算 scores，同时维护 Streaming Top-K
     # ========================================
     
     buffer_base = i_b * T * H * MAX_CANDIDATES + i_t * H * MAX_CANDIDATES + i_h * MAX_CANDIDATES
+    
+    # 3.1 初始化 Streaming Top-K 容器 (encoded scores)
+    # 我们维护一个大小为 TOP_K 的已排序(encoded)数组
+    # 初始化为极小值 (encoded padding)
+    running_topk_encoded = tl.full([TOP_K], -1e10, dtype=tl.float32)
+    
+    # Bit-Packing 常量
+    LOG_N: tl.constexpr = 13  # log2(8192) = 13
+    idx_mask = (1 << LOG_N) - 1  # 0x1FFF
     
     for i_batch in range(num_batches):
         # 加载 32 个父节点索引
@@ -394,96 +403,89 @@ def htree_compute_scores_and_select_kernel(
         batch_scores = tl.where(valid_child_mask_flat, batch_scores, -1e10)
         batch_node_indices = tl.where(valid_child_mask_flat, batch_node_indices, -1)
         
-        # 存储到 8192 buffer
+        # 3.2 存储到 8192 buffer (供 Kernel 2.2 使用)
         buffer_offset = i_batch * BC
         o_bc = tl.arange(0, BC)
         store_mask = (buffer_offset + o_bc) < MAX_CANDIDATES
         
         tl.store(all_scores + buffer_base + buffer_offset + o_bc, batch_scores, mask=store_mask)
         tl.store(all_node_indices + buffer_base + buffer_offset + o_bc, batch_node_indices, mask=store_mask)
-    
+        
+        # 3.3 Streaming Top-K Update (非底层)
+        if not is_bottom_layer:
+            # 3.3.1 预处理当前批次分数
+            # 右侧节点强制选中
+            is_rightmost = (batch_node_indices == rightmost_idx)
+            batch_scores_k = tl.where(is_rightmost, 1e3, batch_scores)
+            
+            # Padding for invalid nodes
+            batch_scores_k = tl.where(valid_child_mask_flat, batch_scores_k, -1e10)
+            
+            # 3.3.2 Bit-Packing 当前批次
+            # 计算当前批次在 buffer 中的位置索引 (0..8191)
+            batch_buffer_indices = buffer_offset + o_bc  # [512]
+            
+            batch_scores_int = batch_scores_k.to(tl.int32, bitcast=True)
+            encoded_idx = tl.where(batch_scores_k >= 0, ~batch_buffer_indices, batch_buffer_indices)
+            encoded_idx = encoded_idx & idx_mask
+            
+            batch_scores_encoded_int = (batch_scores_int & ~idx_mask) | encoded_idx
+            batch_scores_encoded = batch_scores_encoded_int.to(tl.float32, bitcast=True)
+            
+            # 3.3.3 对当前批次进行排序 (Stable Top-K on 512)
+            n_dims_batch: tl.constexpr = 9  # log2(512) = 9
+            sorted_batch = sort_single(
+                batch_scores_encoded, n_dims_batch, 1, descending=True
+            )
+            
+            # 3.3.4 与累积的 Top-K 合并
+            if i_batch == 0:
+                running_topk_encoded = sorted_batch
+            else:
+                # Merge 两个有序数组 (512 + 512 -> 1024)
+                # 构造 [2, 512]
+                running_b = tl.broadcast_to(running_topk_encoded[None, :], [2, BC])
+                batch_b = tl.broadcast_to(sorted_batch[None, :], [2, BC])
+                
+                row_idx = tl.arange(0, 2)[:, None]
+                merged_2d = tl.where(row_idx == 0, running_b, batch_b)
+                
+                # Flatten to [1024]
+                merged_input = tl.reshape(merged_2d, [2 * BC])
+                
+                # 对 [1024] 进行排序
+                n_dims_merge: tl.constexpr = 10  # log2(1024) = 10
+                sorted_merged = sort_single(
+                    merged_input, n_dims_merge, 1, descending=True
+                )
+                
+                # 截取前 512: reshape to [2, 512] and take first row using sum+mask
+                reshaped_merged = tl.reshape(sorted_merged, [2, BC])
+                mask_row0 = (tl.arange(0, 2)[:, None] == 0)
+                running_topk_encoded = tl.sum(tl.where(mask_row0, reshaped_merged, 0.0), axis=0)
+
     # ========================================
-    # 阶段 4: Top-K 选择（非底层）- Bit-Packing 优化版
+    # 阶段 4: Top-K 提取与存储（非底层）
     # ========================================
     
     if not is_bottom_layer:
-        # 4.1 加载 buffer 中的所有 scores 和 node_indices
-        o_buf = tl.arange(0, MAX_CANDIDATES)
-        buffer_scores = tl.load(all_scores + buffer_base + o_buf)
-        buffer_node_indices = tl.load(all_node_indices + buffer_base + o_buf)
-
-        # 4.1.1 仅保留当前批次真正写入且有效的节点
-        written_limit = num_batches * BC
-        written_mask = o_buf < written_limit
-        node_valid_mask = buffer_node_indices >= 0
-        valid_buffer_mask = written_mask & node_valid_mask
-        padding_value = -1e10  # finite padding to avoid NaNs inside sort
-        buffer_scores = tl.where(valid_buffer_mask, buffer_scores, padding_value)
-        buffer_node_indices = tl.where(valid_buffer_mask, buffer_node_indices, -1)
-
-        # 4.2 给 rightmost 节点赋值 1e3（确保它一定被选中）
-        is_rightmost = (buffer_node_indices == rightmost_idx)
-        buffer_scores = tl.where(is_rightmost, 1e3, buffer_scores)
+        # running_topk_encoded 包含了全局 Top-K 的编码分数
         
-        # ================================================================
-        # 4.3 Bit-Packing 编码：将 buffer 位置索引编码到 float32 低位
-        # ================================================================
-        # MAX_CANDIDATES = 8192，需要 13 bits 存储索引
-        LOG_N: tl.constexpr = 13  # log2(8192) = 13
-        idx_mask = (1 << LOG_N) - 1  # 0x1FFF
-        
-        # 将 float32 视为 int32 进行位操作
-        buffer_scores_int = buffer_scores.to(tl.int32, bitcast=True)
-        
-        # 编码索引：
-        # - 正数：取反索引 (~idx)，使小索引在数值相同时排在前面（稳定排序）
-        # - 负数：保持索引原值
-        encoded_idx = tl.where(buffer_scores >= 0, ~o_buf, o_buf)
-        encoded_idx = encoded_idx & idx_mask
-        
-        # 清除 float32 低 13 位，填入编码后的索引
-        buffer_scores_encoded_int = (buffer_scores_int & ~idx_mask) | encoded_idx
-        buffer_scores_encoded = buffer_scores_encoded_int.to(tl.float32, bitcast=True)
-        
-        # ================================================================
-        # 4.4 排序：使用单数组 bitonic sort（索引已编码在值中）
-        # ================================================================
-        n_dims: tl.constexpr = 13  # log2(8192) = 13
-        n_outer: tl.constexpr = 1
-        
-        # 降序排序编码后的值
-        sorted_scores_encoded = sort_single(
-            buffer_scores_encoded, n_dims, n_outer, descending=True
-        )
-        
-        # ================================================================
-        # 4.5 Bit-Packing 解码：从排序结果中提取 buffer 位置和恢复分数
-        # ================================================================
-        # 转回 int32
-        sorted_int = sorted_scores_encoded.to(tl.int32, bitcast=True)
-        
-        # 提取编码的索引（低 13 位）
+        # 4.1 Bit-Packing 解码
+        sorted_int = running_topk_encoded.to(tl.int32, bitcast=True)
         raw_idx = sorted_int & idx_mask
-        
-        # 清除低位恢复分数（用于判断正负）
         clean_int = sorted_int & ~idx_mask
         clean_scores = clean_int.to(tl.float32, bitcast=True)
         
-        # 还原索引：正数时索引被取反了，需要再次取反
-        topk_sort_positions = tl.where(clean_scores >= 0, ~raw_idx, raw_idx)
-        topk_sort_positions = (topk_sort_positions & idx_mask).to(tl.int32)
+        # 还原索引
+        topk_buffer_positions = tl.where(clean_scores >= 0, ~raw_idx, raw_idx)
+        topk_buffer_positions = (topk_buffer_positions & idx_mask).to(tl.int32)
         
-        # ================================================================
-        # 4.6 提取前 TOP_K 个位置
-        # ================================================================
-        # topk_sort_positions: [8192] -> reshape成 [16, 512] -> 取第一行 [512]
-        topk_sort_positions_2d = tl.reshape(topk_sort_positions, [MAX_CANDIDATES // TOP_K, TOP_K])
-        row_mask = (tl.arange(0, MAX_CANDIDATES // TOP_K)[:, None] == 0)
-        topk_buffer_positions = tl.sum(tl.where(row_mask, topk_sort_positions_2d, 0), axis=0).to(tl.int32)  # [TOP_K]
+        # 过滤 Padding 值 (score <= -0.9e10)
+        is_valid_score = clean_scores > -0.9e10
+        topk_buffer_positions = tl.where(is_valid_score, topk_buffer_positions, -1)
         
-        # ================================================================
-        # 4.7 根据 topk_buffer_positions 提取全局节点索引
-        # ================================================================
+        # 4.2 提取全局节点索引
         gather_mask = topk_buffer_positions >= 0
         selected_node_indices = tl.load(
             all_node_indices + buffer_base + topk_buffer_positions,
@@ -491,14 +493,10 @@ def htree_compute_scores_and_select_kernel(
             other=-1,
         )
 
-        # ================================================================
-        # 4.8 对 selected_node_indices 进行升序排序（传给下一层）
-        # ================================================================
-        # 将 -1 替换为 MAX_IDX
+        # 4.3 对 selected_node_indices 进行升序排序（传给下一层）
         MAX_IDX: tl.constexpr = 2147483647
         selected_node_indices_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
 
-        # 升序排序（这里仍用 argsort_v2，因为需要对 int32 排序）
         n_dims_topk: tl.constexpr = 9  # log2(512) = 9
         dummy_indices = tl.arange(0, TOP_K).to(tl.int32)
         selected_node_indices_sorted, _ = argsort_v2(
@@ -507,21 +505,16 @@ def htree_compute_scores_and_select_kernel(
             descending=False
         )
 
-        # 恢复 -1
         selected_node_indices_sorted = tl.where(
             selected_node_indices_sorted < MAX_IDX,
             selected_node_indices_sorted, -1
         )
 
-        # ================================================================
-        # 4.9 存储结果
-        # ================================================================
+        # 4.4 存储结果
         topk_offset = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
         o_topk = tl.arange(0, TOP_K)
         
-        # topk_positions: 在 buffer 中的位置（乱序，用于创建 mask）
         tl.store(topk_positions + topk_offset + o_topk, topk_buffer_positions)
-        # selected_indices: 全局节点索引（升序排序后）
         tl.store(selected_indices + topk_offset + o_topk, selected_node_indices_sorted.to(tl.int32))
     
     else:
@@ -1209,4 +1202,3 @@ __all__ = [
     'htree_merge_to_global_kernel_v2',
     'htree_final_normalize_kernel_v2',
 ]
-

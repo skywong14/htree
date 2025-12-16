@@ -61,6 +61,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     
     # 测试配置
     B, T, H, K, V = 1, 40000, 4, 32, 32
+    B, T, H, K, V = 1, 150000, 1, 4, 4
     
     # 使用 float32，确保 naive 与 triton 输入精度一致
     q = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
