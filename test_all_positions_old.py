@@ -1,13 +1,13 @@
 """
-测试全部位置的 naive 和 parallel2 实现对比
+测试全部位置的 naive 和 parallel 实现对比
 
-配置: B=1, T=12000, H=1, K=8, V=8
-测试所有位置，简化日志输出
+配置: B=1, T=20000, H=1, K=8, V=8
+测试所有20000个位置，简化日志输出
 """
 
 import sys
 import torch
-from src.parallel2 import htree_forward_v2
+from src.parallel import htree_forward
 from src.naive import forward_kernel as naive_forward
 
 
@@ -56,19 +56,19 @@ def test_all_positions():
         print(f"✗ Naive forward 失败: {e}")
         raise
     
-    # Parallel2 实现
-    print("运行 Parallel2 实现...")
+    # Parallel 实现
+    print("运行 Parallel 实现...")
     try:
-        output_triton = htree_forward_v2(
+        output_triton = htree_forward(
             q, k, v,
             compression_rate=compression_rate,
             max_top_nodes=max_top_nodes,
             top_k_per_layer=top_k_per_layer,
             scale=scale,
         )
-        print(f"✓ Parallel2 forward 完成: output shape {output_triton.shape}\n")
+        print(f"✓ Parallel forward 完成: output shape {output_triton.shape}\n")
     except Exception as e:
-        print(f"✗ Parallel2 forward 失败: {e}")
+        print(f"✗ Parallel forward 失败: {e}")
         raise
     
     # 误差分析
@@ -107,8 +107,8 @@ def test_all_positions():
         all_mean_rel_diffs.append(mean_rel_diff)
         
         # 检查是否通过（宽松阈值）
-        pass_abs = max_abs_diff < 0.01
-        pass_mean = mean_abs_diff < 0.01
+        pass_abs = max_abs_diff < 0.001
+        pass_mean = mean_abs_diff < 0.0001
         
         if not (pass_abs and pass_mean):
             failed_positions.append({
@@ -172,14 +172,14 @@ def test_all_positions():
         print(f"失败位置数量: {len(failed_positions)}/{T}")
         print("="*80)
         
-        # 显示前100个失败位置的详细信息
-        print(f"\n显示前{min(100, len(failed_positions))}个失败位置的详细信息:\n")
-        for i, fail_info in enumerate(failed_positions[:100]):
+        # 显示前30个失败位置的详细信息
+        print(f"\n显示前{min(30, len(failed_positions))}个失败位置的详细信息:\n")
+        for i, fail_info in enumerate(failed_positions[:30]):
             print(f"位置 {fail_info['pos']}:")
             print(f"  max_abs={fail_info['max_abs']:.6f}, mean_abs={fail_info['mean_abs']:.6f}")
             print(f"  max_rel={fail_info['max_rel']:.6f}, mean_rel={fail_info['mean_rel']:.6f}")
-            print(f"  Naive:    {fail_info['naive']}")
-            print(f"  Parallel2: {fail_info['triton']}")
+            print(f"  Naive:  {fail_info['naive']}")
+            print(f"  Triton: {fail_info['triton']}")
             print()
     else:
         print(f"\n✓ 所有{T}个位置测试通过!")
@@ -198,5 +198,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
