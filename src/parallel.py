@@ -33,14 +33,14 @@ import triton.language as tl
 
 @triton.jit
 def htree_build_kernel_v2(
-    child_k,  # [B, N_child, H, K]
-    child_v,  # [B, N_child, H, V]
-    parent_k,  # [B, N_parent, H, K]
-    parent_v,  # [B, N_parent, H, V]
+    child_k,  # [B, N_child, H_kv, K]
+    child_v,  # [B, N_child, H_kv, V]
+    parent_k,  # [B, N_parent, H_kv, K]
+    parent_v,  # [B, N_parent, H_kv, V]
     N_child: tl.constexpr,
     N_parent: tl.constexpr,
     B: tl.constexpr,
-    H: tl.constexpr,
+    H_kv: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
@@ -48,11 +48,11 @@ def htree_build_kernel_v2(
 ):
     """
     Tree building kernel: mean pooling from child nodes to parent nodes
-    Grid: (B * H,)
+    Grid: (B * H_kv,)
     """
     i_bh = tl.program_id(0)
-    i_b = i_bh // H
-    i_h = i_bh % H
+    i_b = i_bh // H_kv
+    i_h = i_bh % H_kv
     
     num_iterations = tl.cdiv(N_parent, BLOCK_SIZE)
     
@@ -61,11 +61,11 @@ def htree_build_kernel_v2(
         child_start = parent_start * COMPRESSION_RATE
         
         # load K
-        k_base = child_k + i_b * N_child * H * K + i_h * K
+        k_base = child_k + i_b.to(tl.int64) * N_child * H_kv * K + i_h.to(tl.int64) * K
         k_block_ptrs = tl.make_block_ptr(
             base=k_base,
             shape=(N_child, K),
-            strides=(H * K, 1),
+            strides=(H_kv * K, 1),
             offsets=(child_start, 0),
             block_shape=(BLOCK_SIZE * COMPRESSION_RATE, K),
             order=(1, 0)
@@ -73,11 +73,11 @@ def htree_build_kernel_v2(
         k_vals = tl.load(k_block_ptrs, boundary_check=(0, 1))
         
         # load V
-        v_base = child_v + i_b * N_child * H * V + i_h * V
+        v_base = child_v + i_b.to(tl.int64) * N_child * H_kv * V + i_h.to(tl.int64) * V
         v_block_ptrs = tl.make_block_ptr(
             base=v_base,
             shape=(N_child, V),
-            strides=(H * V, 1),
+            strides=(H_kv * V, 1),
             offsets=(child_start, 0),
             block_shape=(BLOCK_SIZE * COMPRESSION_RATE, V),
             order=(1, 0)
@@ -102,22 +102,22 @@ def htree_build_kernel_v2(
         v_mean = v_sum / num_valid_children_safe[:, None]
         
         # store
-        parent_k_base = parent_k + i_b * N_parent * H * K + i_h * K
+        parent_k_base = parent_k + i_b.to(tl.int64) * N_parent * H_kv * K + i_h.to(tl.int64) * K
         parent_k_block_ptrs = tl.make_block_ptr(
             base=parent_k_base,
             shape=(N_parent, K),
-            strides=(H * K, 1),
+            strides=(H_kv * K, 1),
             offsets=(parent_start, 0),
             block_shape=(BLOCK_SIZE, K),
             order=(1, 0)
         )
         tl.store(parent_k_block_ptrs, k_mean.to(parent_k.dtype.element_ty), boundary_check=(0, 1))
         
-        parent_v_base = parent_v + i_b * N_parent * H * V + i_h * V
+        parent_v_base = parent_v + i_b.to(tl.int64) * N_parent * H_kv * V + i_h.to(tl.int64) * V
         parent_v_block_ptrs = tl.make_block_ptr(
             base=parent_v_base,
             shape=(N_parent, V),
-            strides=(H * V, 1),
+            strides=(H_kv * V, 1),
             offsets=(parent_start, 0),
             block_shape=(BLOCK_SIZE, V),
             order=(1, 0)
@@ -135,23 +135,23 @@ def load_k_with_rope_v2(
     cos_cache,
     sin_cache,
     i_b,
-    i_h,
+    i_h_kv,
     child_start,
     rope_position_start,
     N_layer: tl.constexpr,
-    H: tl.constexpr,
+    H_kv: tl.constexpr,
     K: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     num_valid_children,
 ):
     """加载 16 个 token 的 K 并应用 RoPE 编码"""
-    k_base = layer_k + i_b * N_layer * H * K + i_h * K
+    k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
     
     # 前半部分
     k1_block_ptrs = tl.make_block_ptr(
         base=k_base,
         shape=(N_layer, K),
-        strides=(H * K, 1),
+        strides=(H_kv * K, 1),
         offsets=(child_start, 0),
         block_shape=(COMPRESSION_RATE, K // 2),
         order=(1, 0)
@@ -162,7 +162,7 @@ def load_k_with_rope_v2(
     k2_block_ptrs = tl.make_block_ptr(
         base=k_base,
         shape=(N_layer, K),
-        strides=(H * K, 1),
+        strides=(H_kv * K, 1),
         offsets=(child_start, K // 2),
         block_shape=(COMPRESSION_RATE, K // 2),
         order=(1, 0)
@@ -189,20 +189,20 @@ def load_k_with_rope_v2(
 def load_v_v2(
     layer_v,
     i_b,
-    i_h,
+    i_h_kv,
     child_start,
     N_layer: tl.constexpr,
-    H: tl.constexpr,
+    H_kv: tl.constexpr,
     V: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
 ):
     """加载 16 个 token 的 V"""
-    v_base = layer_v + i_b * N_layer * H * V + i_h * V
+    v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
     
     v_block_ptrs = tl.make_block_ptr(
         base=v_base,
         shape=(N_layer, V),
-        strides=(H * V, 1),
+        strides=(H_kv * V, 1),
         offsets=(child_start, 0),
         block_shape=(COMPRESSION_RATE, V),
         order=(1, 0)
@@ -228,7 +228,7 @@ def load_v_v2(
 @triton.jit
 def htree_compute_scores_and_select_kernel(
     q,  # [B, T, H, K]
-    layer_k,  # [B, N_layer, H, K]
+    layer_k,  # [B, N_layer, H_kv, K]
     prev_selected_parents,  # [B, T, H, TOP_K]
     cos_cache, sin_cache,  # [cache_size, K//2]
     # 输出 buffer
@@ -242,6 +242,8 @@ def htree_compute_scores_and_select_kernel(
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr, T, H: tl.constexpr,
+    H_kv: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     K: tl.constexpr, V: tl.constexpr,
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
@@ -257,6 +259,8 @@ def htree_compute_scores_and_select_kernel(
     i_bh = tl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H
+    # GQA: 映射 Query 头索引到 KV 头索引
+    i_h_kv = i_h // NUM_GROUPS
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
     BC: tl.constexpr = TOP_K  # 512
@@ -268,7 +272,12 @@ def htree_compute_scores_and_select_kernel(
     
     rightmost_idx = i_t // layer_power
     
-    prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+    T_i64 = T.to(tl.int64)
+    prev_sel_base = (
+        i_b.to(tl.int64) * T_i64 * H * TOP_K
+        + i_t.to(tl.int64) * H * TOP_K
+        + i_h.to(tl.int64) * TOP_K
+    )
     o_parent = tl.arange(0, TOP_K)
     parent_list = tl.load(prev_selected_parents + prev_sel_base + o_parent)
     
@@ -283,7 +292,11 @@ def htree_compute_scores_and_select_kernel(
         n_cand = 0
     
     # 存储 num_candidates
-    num_cand_offset = i_b * T * H + i_t * H + i_h
+    num_cand_offset = (
+        i_b.to(tl.int64) * T_i64 * H
+        + i_t.to(tl.int64) * H
+        + i_h.to(tl.int64)
+    )
     tl.store(num_candidates + num_cand_offset, n_cand)
     
     # ========================================
@@ -292,14 +305,19 @@ def htree_compute_scores_and_select_kernel(
     
     rope_pos_q = tl.maximum(n_cand - 1, 0)
     
-    q_offset = i_b * T * H * K + i_t * H * K + i_h * K
+    q_offset = (
+        i_b.to(tl.int64) * T_i64 * H * K
+        + i_t.to(tl.int64) * H * K
+        + i_h.to(tl.int64) * K
+    )
     o_k = tl.arange(0, K // 2)
     
     q1 = tl.load(q + q_offset + o_k)
     q2 = tl.load(q + q_offset + (K // 2) + o_k)
     
-    cos_q = tl.load(cos_cache + rope_pos_q * (K // 2) + o_k)
-    sin_q = tl.load(sin_cache + rope_pos_q * (K // 2) + o_k)
+    rope_pos_q_i64 = rope_pos_q.to(tl.int64)
+    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + o_k)
+    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k)
     
     q_rope_1 = (q1 * cos_q - q2 * sin_q) * scale
     q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
@@ -307,8 +325,15 @@ def htree_compute_scores_and_select_kernel(
     # ========================================
     # 阶段 3: 批次遍历，加载 K 并计算 scores，同时维护 Streaming Top-K
     # ========================================
-    
-    buffer_base = i_b * T * H * MAX_CANDIDATES + i_t * H * MAX_CANDIDATES + i_h * MAX_CANDIDATES
+
+    # NOTE: all_scores/all_node_indices are [B, T, H, MAX_CANDIDATES]. When T*H*MAX_CANDIDATES
+    # exceeds 2^31-1 (e.g., T=20000, H=16, MAX_CANDIDATES=8192), int32 offset math overflows and
+    # can produce negative pointers, causing illegal memory access. Promote to int64 explicitly.
+    buffer_base = (
+        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
+        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+        + i_h.to(tl.int64) * MAX_CANDIDATES
+    )
     
     # 3.1 初始化 Streaming Top-K 容器 (encoded scores)
     # 我们维护一个大小为 TOP_K 的已排序(encoded)数组
@@ -367,11 +392,11 @@ def htree_compute_scores_and_select_kernel(
                 ).to(tl.int1)
                 num_valid_children = tl.sum(current_parent_mask.to(tl.int32))
                 
-                # 加载 K 并应用 RoPE
+                # 加载 K 并应用 RoPE (使用 GQA 映射的 i_h_kv)
                 k_rope_1, k_rope_2 = load_k_with_rope_v2(
                     layer_k, cos_cache, sin_cache,
-                    i_b, i_h, child_start, rope_pos_start,
-                    N_layer, H, K, COMPRESSION_RATE, num_valid_children
+                    i_b, i_h_kv, child_start, rope_pos_start,
+                    N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
                 )
                 
                 # 计算 scores
@@ -511,7 +536,11 @@ def htree_compute_scores_and_select_kernel(
         )
 
         # 4.4 存储结果
-        topk_offset = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+        topk_offset = (
+            i_b.to(tl.int64) * T_i64 * H * TOP_K
+            + i_t.to(tl.int64) * H * TOP_K
+            + i_h.to(tl.int64) * TOP_K
+        )
         o_topk = tl.arange(0, TOP_K)
         
         tl.store(topk_positions + topk_offset + o_topk, topk_buffer_positions)
@@ -519,7 +548,11 @@ def htree_compute_scores_and_select_kernel(
     
     else:
         # 底层：跳过排序，输出 -1
-        topk_offset = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+        topk_offset = (
+            i_b.to(tl.int64) * T_i64 * H * TOP_K
+            + i_t.to(tl.int64) * H * TOP_K
+            + i_h.to(tl.int64) * TOP_K
+        )
         o_topk = tl.arange(0, TOP_K)
         
         tl.store(topk_positions + topk_offset + o_topk, tl.full([TOP_K], -1, dtype=tl.int32))
@@ -541,7 +574,7 @@ def htree_compute_scores_and_select_kernel(
 # )
 @triton.jit
 def htree_accumulate_non_topk_kernel(
-    layer_v,  # [B, N_layer, H, V]
+    layer_v,  # [B, N_layer, H_kv, V]
     prev_selected_parents,  # [B, T, H, TOP_K]
     # Kernel 2.1 的输出
     all_scores,  # [B, T, H, MAX_CANDIDATES]
@@ -555,6 +588,8 @@ def htree_accumulate_non_topk_kernel(
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr, T, H: tl.constexpr,
+    H_kv: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     V: tl.constexpr,
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
@@ -569,6 +604,8 @@ def htree_accumulate_non_topk_kernel(
     i_bh = tl.program_id(1)
     i_b = i_bh // H
     i_h = i_bh % H
+    # GQA: 映射 Query 头索引到 KV 头索引
+    i_h_kv = i_h // NUM_GROUPS
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
     BC: tl.constexpr = TOP_K  # 512
@@ -580,14 +617,28 @@ def htree_accumulate_non_topk_kernel(
     # 阶段 1: 加载元数据
     # ========================================
     
-    num_cand_offset = i_b * T * H + i_t * H + i_h
+    T_i64 = T.to(tl.int64)
+    num_cand_offset = (
+        i_b.to(tl.int64) * T_i64 * H
+        + i_t.to(tl.int64) * H
+        + i_h.to(tl.int64)
+    )
     n_cand = tl.load(num_candidates + num_cand_offset)
     
-    topk_offset = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+    topk_offset = (
+        i_b.to(tl.int64) * T_i64 * H * TOP_K
+        + i_t.to(tl.int64) * H * TOP_K
+        + i_h.to(tl.int64) * TOP_K
+    )
     o_topk = tl.arange(0, TOP_K)
     topk_pos_vals = tl.load(topk_positions + topk_offset + o_topk) # topk_pos_vals [TOP_K] 内容为 buffer 中的下标位置（乱序）
     
-    buffer_base = i_b * T * H * MAX_CANDIDATES + i_t * H * MAX_CANDIDATES + i_h * MAX_CANDIDATES
+    # Same overflow issue as Kernel 2.1: promote linear indexing to int64.
+    buffer_base = (
+        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
+        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+        + i_h.to(tl.int64) * MAX_CANDIDATES
+    )
     
     # ========================================
     # 阶段 3: 流式加载 V 并累积（Stream Accumulate）
@@ -598,7 +649,11 @@ def htree_accumulate_non_topk_kernel(
     cur_sum = tl.zeros((), dtype=tl.float32)
     cur_output = tl.zeros([V], dtype=tl.float32)
     
-    prev_sel_base = i_b * T * H * TOP_K + i_t * H * TOP_K + i_h * TOP_K
+    prev_sel_base = (
+        i_b.to(tl.int64) * T_i64 * H * TOP_K
+        + i_t.to(tl.int64) * H * TOP_K
+        + i_h.to(tl.int64) * TOP_K
+    )
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
     valid_parent_list_mask = parent_list >= 0
     num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
@@ -617,10 +672,10 @@ def htree_accumulate_non_topk_kernel(
             if parent_idx >= 0:
                 child_start = parent_idx * COMPRESSION_RATE
                 
-                # 加载当前父节点的 V values [16, V]
+                # 加载当前父节点的 V values [16, V] (使用 GQA 映射的 i_h_kv)
                 v_vals = load_v_v2(
-                    layer_v, i_b, i_h, child_start,
-                    N_layer, H, V, COMPRESSION_RATE
+                    layer_v, i_b, i_h_kv, child_start,
+                    N_layer, H_kv, V, COMPRESSION_RATE
                 )
                 
                 # 计算当前父节点的有效子节点数
@@ -683,11 +738,19 @@ def htree_accumulate_non_topk_kernel(
     # 阶段 4: 存储结果
     # ========================================
     
-    state_offset = i_b * T * H + i_t * H + i_h
+    state_offset = (
+        i_b.to(tl.int64) * T_i64 * H
+        + i_t.to(tl.int64) * H
+        + i_h.to(tl.int64)
+    )
     tl.store(layer_max + state_offset, cur_max)
     tl.store(layer_sum + state_offset, cur_sum)
     
-    output_offset = i_b * T * H * V + i_t * H * V + i_h * V
+    output_offset = (
+        i_b.to(tl.int64) * T_i64 * H * V
+        + i_t.to(tl.int64) * H * V
+        + i_h.to(tl.int64) * V
+    )
     o_v = tl.arange(0, V)
     tl.store(layer_output + output_offset + o_v, cur_output, mask=o_v < V)
 
@@ -715,12 +778,21 @@ def htree_merge_to_global_kernel_v2(
     i_b = i_bh // H
     i_h = i_bh % H
     
-    state_offset = i_b * T * H + i_t * H + i_h
+    T_i64 = T.to(tl.int64)
+    state_offset = (
+        i_b.to(tl.int64) * T_i64 * H
+        + i_t.to(tl.int64) * H
+        + i_h.to(tl.int64)
+    )
     
     cur_max = tl.load(layer_max + state_offset)
     cur_sum = tl.load(layer_sum + state_offset)
     
-    output_offset = i_b * T * H * V + i_t * H * V + i_h * V
+    output_offset = (
+        i_b.to(tl.int64) * T_i64 * H * V
+        + i_t.to(tl.int64) * H * V
+        + i_h.to(tl.int64) * V
+    )
     o_v = tl.arange(0, V)
     cur_output = tl.load(layer_output + output_offset + o_v, mask=o_v < V, other=0.0)
     
@@ -780,11 +852,20 @@ def htree_final_normalize_kernel_v2(
     i_h = i_bh % H
     
     # load sum
-    sum_offset = i_b * T * H + i_t * H + i_h
+    T_i64 = T.to(tl.int64)
+    sum_offset = (
+        i_b.to(tl.int64) * T_i64 * H
+        + i_t.to(tl.int64) * H
+        + i_h.to(tl.int64)
+    )
     sum_val = tl.load(global_sum + sum_offset)
     
     # load and normalize output
-    output_offset = i_b * T * H * V + i_t * H * V + i_h * V
+    output_offset = (
+        i_b.to(tl.int64) * T_i64 * H * V
+        + i_t.to(tl.int64) * H * V
+        + i_h.to(tl.int64) * V
+    )
     o_v = tl.arange(0, V)
     output_ptrs = global_output + output_offset + o_v
     output_vals = tl.load(output_ptrs, mask=o_v < V, other=0.0)
@@ -944,12 +1025,12 @@ def htree_forward_v2(
     rope_base: float = 10000.0,
 ) -> torch.Tensor:
     """
-    htree 前向传播 V2 (基于 naive.py 的思路)
+    htree 前向传播 V2 (支持 Group Query Attention)
     
     Args:
-        q: [B, T, H, K]
-        k: [B, T, H, K]
-        v: [B, T, H, V]
+        q: [B, T, H, K] - Query，H 个头
+        k: [B, T, H_kv, K] - Key，H_kv 个头 (H_kv <= H, H % H_kv == 0)
+        v: [B, T, H_kv, V] - Value，H_kv 个头
         compression_rate: 16
         max_top_nodes: 8192
         top_k_per_layer: 512
@@ -958,9 +1039,19 @@ def htree_forward_v2(
     
     Returns:
         output: [B, T, H, V]
+    
+    Note:
+        - 当 H_kv == H 时，等价于 Multi-Head Attention (MHA)
+        - 当 H_kv == 1 时，等价于 Multi-Query Attention (MQA)
+        - 当 1 < H_kv < H 时，为 Group Query Attention (GQA)
     """
     B, T, H, K = q.shape
+    H_kv = k.shape[2]  # KV 头数量
     V = v.shape[-1]
+    
+    # 验证 GQA 配置
+    assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"
+    assert k.shape[2] == v.shape[2], f"K and V must have same number of heads"
     
     if scale is None:
         scale = K ** -0.5
@@ -982,7 +1073,7 @@ def htree_forward_v2(
         temp_len = (temp_len + compression_rate - 1) // compression_rate
         num_layers += 1
     
-    print(f"  Tree has {num_layers} layers")
+    print(f"  Tree has {num_layers} layers (H={H}, H_kv={H_kv}, num_groups={H // H_kv})")
     
     layers_k = [k]
     layers_v = [v]
@@ -992,26 +1083,36 @@ def htree_forward_v2(
     
     for layer_idx in range(1, num_layers):
         next_len = (current_len + compression_rate - 1) // compression_rate
-        next_k = torch.empty(B, next_len, H, K, dtype=dtype, device=device)
-        next_v = torch.empty(B, next_len, H, V, dtype=dtype, device=device)
+        next_k = torch.empty(B, next_len, H_kv, K, dtype=dtype, device=device)
+        next_v = torch.empty(B, next_len, H_kv, V, dtype=dtype, device=device)
         
         BLOCK_SIZE = 128
-        grid = (B * H,)
+        grid = (B * H_kv,)
+        
+        torch.cuda.synchronize()
+        start_build = torch.cuda.Event(enable_timing=True)
+        end_build = torch.cuda.Event(enable_timing=True)
+        start_build.record()
+
         htree_build_kernel_v2[grid](
             current_k, current_v, next_k, next_v,
             N_child=current_len,
             N_parent=next_len,
-            B=B, H=H, K=K, V=V,
+            B=B, H_kv=H_kv, K=K, V=V,
             COMPRESSION_RATE=compression_rate,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+
+        end_build.record()
+        torch.cuda.synchronize()
+        time_build = start_build.elapsed_time(end_build)
         
         layers_k.append(next_k)
         layers_v.append(next_v)
         current_k, current_v = next_k, next_v
         current_len = next_len
         
-        print(f"  Built layer {layer_idx}: {current_len} nodes")
+        print(f"  Built layer {layer_idx}: {current_len} nodes, time: {time_build:.2f} ms")
     nvtx.range_pop()
 
     # ========== Phase 1.5: Precompute RoPE cache ==========
@@ -1096,7 +1197,9 @@ def htree_forward_v2(
             topk_positions, selected_indices,
             layer_idx=layer_idx,
             layer_power=layer_power,
-            B=B, T=T, H=H, K=K, V=V, N_layer=N_layer,
+            B=B, T=T, H=H, H_kv=H_kv,
+            NUM_GROUPS=H // H_kv,
+            K=K, V=V, N_layer=N_layer,
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,
@@ -1126,7 +1229,9 @@ def htree_forward_v2(
             layer_max, layer_sum, layer_output,
             layer_idx=layer_idx,
             layer_power=layer_power,
-            B=B, T=T, H=H, V=V, N_layer=N_layer,
+            B=B, T=T, H=H, H_kv=H_kv,
+            NUM_GROUPS=H // H_kv,
+            V=V, N_layer=N_layer,
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,

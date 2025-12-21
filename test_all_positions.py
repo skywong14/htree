@@ -1,10 +1,7 @@
 """
 测试全部位置的 naive_stable_topk 和 parallel2_stable_topk 实现对比
+(支持 Group Query Attention)
 
-配置: B=1, T=12000, H=1, K=8, V=8
-测试所有位置，简化日志输出
-
-该测试用于验证 Bit-Packing Top-K 优化后的正确性
 两个实现都使用 Bit-Packing Top-K 技术，确保结果一致
 """
 
@@ -60,14 +57,13 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # 测试配置
-    B, T, H, K, V = 1, 40000, 4, 32, 32
-    B, T, H, K, V = 1, 150000, 1, 4, 4
-    # 1, 120000, 64, 4, 4
+    # GQA Configuration: H (Query Heads), H_kv (KV Heads)
+    B, T, H, H_kv, K, V = 1, 20000, 16, 4, 4, 4
     
     # 使用 float32，确保 naive 与 triton 输入精度一致
     q = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
-    k = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
-    v = torch.randn(B, T, H, V, device=device, dtype=torch.float32).contiguous()
+    k = torch.randn(B, T, H_kv, K, device=device, dtype=torch.float32).contiguous()
+    v = torch.randn(B, T, H_kv, V, device=device, dtype=torch.float32).contiguous()
 
     compression_rate = 16
     max_top_nodes = 8192
@@ -75,7 +71,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     scale = K ** -0.5
     
     print("\n" + "="*80)
-    print(f"全位置对比测试配置 (Bit-Packing Stable TopK): B={B}, T={T}, H={H}, K={K}, V={V}")
+    print(f"全位置对比测试配置 (GQA): B={B}, T={T}, H={H}, H_kv={H_kv}, K={K}, V={V}")
     print(f"compression_rate={compression_rate}, top_k_per_layer={top_k_per_layer}")
     print(f"scale={scale}")
     print(f"compare_naive={compare_naive}")
@@ -105,7 +101,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     else:
         print("跳过 naive_stable_topk 实现的运行 (--compare-naive=False)\n")
 
-    # Triton warmup：把 JIT 编译 / cuModuleLoadData 等一次性开销赶到计时/采样外
+    # Triton warmup
     _warmup_triton(
         q, k, v,
         compression_rate=compression_rate,

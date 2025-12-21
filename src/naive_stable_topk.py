@@ -236,18 +236,18 @@ def build_tree(
     Build hierarchical structure of htree.
 
     Args:
-        k: [B, T, H, D]
-        v: [B, T, H, D]
+        k: [B, T, H_kv, D]
+        v: [B, T, H_kv, D]
         compression_rate: Compression rate, 16.
         max_top_nodes: Maximum number of top nodes, 8192.
 
     Returns:
         layers: Hierarchical list, each element is (K_layer, V_layer, node_ranges)
-            - K_layer, V_layer: [B, N_nodes, H, D]
+            - K_layer, V_layer: [B, N_nodes, H_kv, D]
             - node_ranges: [N_nodes, 2] Each node covers the token range [start, end)
     """
     nvtx.range_push("BuildTree")
-    B, T, H, D = k.shape
+    B, T, H_kv, D = k.shape
     layers = []
     
     # TODO node_ranges也许没有必要，因为整个树的结构是唯一确定的
@@ -270,13 +270,13 @@ def build_tree(
         # padding
         pad_len = next_len * compression_rate - current_len
         if pad_len > 0:
-            current_k = F.pad(current_k, (0, 0, 0, 0, 0, pad_len))  # [B, next_len*compression_rate, H, D]
+            current_k = F.pad(current_k, (0, 0, 0, 0, 0, pad_len))  # [B, next_len*compression_rate, H_kv, D]
             current_v = F.pad(current_v, (0, 0, 0, 0, 0, pad_len))
         
         # Reshape & mean
-        # [B, next_len*compression_rate, H, D] -> [B, next_len, compression_rate, H, D] -> [B, next_len, H, D]
-        next_k = current_k.view(B, next_len, compression_rate, H, D).mean(dim=2)
-        next_v = current_v.view(B, next_len, compression_rate, H, D).mean(dim=2)
+        # [B, next_len*compression_rate, H_kv, D] -> [B, next_len, compression_rate, H_kv, D] -> [B, next_len, H_kv, D]
+        next_k = current_k.view(B, next_len, compression_rate, H_kv, D).mean(dim=2)
+        next_v = current_v.view(B, next_len, compression_rate, H_kv, D).mean(dim=2)
         
         # 节点范围: 每个父节点覆盖 compression_rate 个子节点的范围
         prev_ranges = layers[-1][2]  # [current_len, 2]
@@ -374,7 +374,7 @@ def compute_select_and_merge(
     Compute attention scores, select Top-K nodes, and merge non-selected nodes into softmax state.
     
     Args:
-        layer_k, layer_v: [1, N, 1, D] Single head data
+        layer_k, layer_v: [1, N, 1, D] Single head data (already mapped to correct KV head)
         node_ranges: [N, 2] Each node covers the token range [start, end)
         query: [1, 1, D] Single head query
         query_pos: query position m
@@ -518,138 +518,6 @@ def compute_select_and_merge(
         return max_score, sum_exp, weighted_output, selected_indices
 
 
-def compute_and_select_only(
-    layer_k: torch.Tensor,
-    layer_v: torch.Tensor,
-    node_ranges: torch.Tensor,
-    query: torch.Tensor,
-    query_pos: int,
-    prev_selected_parent_indices: Optional[torch.Tensor],
-    compression_rate: int,
-    layer_idx: int,
-    rotary: Rotary,
-    max_score: torch.Tensor,
-    sum_exp: torch.Tensor,
-    weighted_output: torch.Tensor,
-    top_k: int = 512,
-    scale: Optional[float] = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """
-    Compute attention scores, select Top-K nodes, and merge ALL candidates into softmax state.
-    This simulates Kernel 2.1 behavior (before subtract_topk).
-    
-    Args:
-        Same as compute_select_and_merge
-    
-    Returns:
-        max_score: [1] Updated maximum score (after merging ALL candidates)
-        sum_exp: [1] Updated sum of exponentials (after merging ALL candidates)
-        weighted_output: [1, 1, D] Updated weighted output (after merging ALL candidates)
-        selected_indices: [1, top_k] Selected node indices for next layer (None for bottom layer)
-        topk_indices_unsorted: [top_k] Top-K indices in importance order (padded with -1)
-        topk_scores_unsorted: [top_k] Top-K scores in importance order
-    """
-    B, N, H, D = layer_k.shape
-    device = layer_k.device
-    
-    assert B == 1 and H == 1, "This function processes single head data"
-    
-    if scale is None:
-        scale = D ** -0.5
-    
-    # 确定候选节点范围
-    if prev_selected_parent_indices is None:
-        # 顶层：考虑所有左边界 ≤ m 的节点
-        candidates_mask = node_ranges[:, 0] <= query_pos
-    else:
-        # 非顶层：只考虑上一层选中节点的子节点
-        parents = prev_selected_parent_indices.reshape(-1)  # [M]
-        child_offsets = torch.arange(compression_rate, device=device)
-        children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
-        children = children[children < N]
-        
-        # 过滤：只保留左边界 ≤ m 的节点
-        valid_mask = node_ranges[:, 0] <= query_pos
-        valid_children = children[valid_mask[children]]
-        
-        candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        candidates_mask[valid_children] = True
-    
-    # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
-    rightmost_idx = query_pos // (compression_rate ** layer_idx)
-    if rightmost_idx < N:
-        candidates_mask[rightmost_idx] = True
-    
-    # 提取候选节点
-    candidate_indices = torch.where(candidates_mask)[0]  # [num_cand]
-    candidate_indices = torch.sort(candidate_indices)[0]  # 确保有序
-    num_candidates = candidate_indices.numel()
-    
-    if num_candidates == 0:
-        raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
-    
-    candidate_k = layer_k[:, candidates_mask]  # [1, num_cand, 1, D]
-    candidate_v = layer_v[:, candidates_mask]  # [1, num_cand, 1, D]
-    
-    # 应用 RoPE - 需要先初始化缓存
-    positions = torch.arange(num_candidates, device=device)
-    cos, sin = rotary.forward(positions, device)
-    candidate_k_rope = apply_rotary_emb(candidate_k, cos[None, :, None, :], sin[None, :, None, :])
-    
-    # Query 使用最后一个位置（与最右侧候选节点相同）
-    cos_q = cos[num_candidates - 1]
-    sin_q = sin[num_candidates - 1]
-    query_rope = apply_rotary_emb(query, cos_q, sin_q)
-    
-    # 计算注意力分数 (single head, no pooling)
-    scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
-    scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
-    
-    # Merge ALL candidates into softmax state (Kernel 2.1 behavior)
-    merge_scores = scores_pooled.unsqueeze(0)  # [1, num_cand]
-    merge_values = candidate_v  # [1, num_cand, 1, D]
-    
-    max_score, sum_exp, weighted_output = online_softmax_merge(
-        max_score, sum_exp, weighted_output, merge_scores, merge_values
-    )
-    
-    # Select Top-K for next layer (but don't subtract them yet)
-    is_bottom_layer = (layer_idx == 0)
-    if is_bottom_layer:
-        selected_indices = None
-        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
-        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
-    else:
-        # 使用 importance 选择 Top-K（与 compute_select_and_merge 一致）
-        # 计算当前最大分数（merge 后的 max_score）
-        cur_max = max_score.item()
-        
-        # 计算 importance：最右侧节点 = 1.0，其他节点 = exp(score - cur_max)
-        is_rightmost = (candidate_indices == rightmost_idx)
-        importance = torch.where(
-            is_rightmost,
-            torch.tensor(1.0, device=device, dtype=scores_pooled.dtype),
-            torch.exp(scores_pooled - cur_max)
-        )
-        
-        # 基于 importance 选择 Top-K
-        actual_top_k = min(top_k, num_candidates)
-        topk_importance, topk_local_idx = torch.topk(importance, actual_top_k, dim=0)  # [actual_top_k]
-        
-        # 选中的节点索引
-        selected_indices = candidate_indices[topk_local_idx].unsqueeze(0)  # [1, actual_top_k]
-        
-        # 返回未排序的 Top-K 信息（按 importance 顺序，padded with -1）
-        # 注意：这里返回的是原始 score，不是 importance
-        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
-        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
-        
-        topk_indices_unsorted[:actual_top_k] = candidate_indices[topk_local_idx].to(torch.int32)
-        topk_scores_unsorted[:actual_top_k] = scores_pooled[topk_local_idx]
-    
-    return max_score, sum_exp, weighted_output, selected_indices, topk_indices_unsorted, topk_scores_unsorted
-
-
 def forward_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -661,12 +529,12 @@ def forward_kernel(
     scale: Optional[float] = None
 ) -> torch.Tensor:
     """
-    forward kernel with online softmax algorithm
+    forward kernel with online softmax algorithm (Supports Group Query Attention)
 
     Args:
         q: [B, T, H, D]
-        k: [B, T, H, D]
-        v: [B, T, H, D]
+        k: [B, T, H_kv, D]
+        v: [B, T, H_kv, D]
         query_positions: [B, num_positions] or None
             If None, compute attention for all positions.
             If provided, only compute attention for specified positions per batch.
@@ -680,6 +548,11 @@ def forward_kernel(
     """
     nvtx.range_push("Naive_Forward")
     B, T, H, D = q.shape
+    H_kv = k.shape[2]
+    
+    assert H % H_kv == 0, f"Query heads {H} must be divisible by KV heads {H_kv}"
+    group_size = H // H_kv
+    
     device = q.device
     if scale is None:
         scale = D ** -0.5
@@ -707,6 +580,9 @@ def forward_kernel(
             positions_to_compute = [p for p in batch_positions if p >= 0]
         
         for h in range(H):
+            # Determine which KV head to use
+            kv_h = h // group_size
+            
             for t in positions_to_compute:
                 current_query = q[b:b+1, t, h:h+1]  # [1, 1, D]
                 
@@ -721,9 +597,13 @@ def forward_kernel(
                 for layer_idx in range(num_layers - 1, -1, -1):
                     layer_k, layer_v, node_ranges = layers[layer_idx]
                     
+                    # Select the specific KV head
+                    layer_k_head = layer_k[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
+                    layer_v_head = layer_v[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
+                    
                     max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
-                        layer_k[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
-                        layer_v[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
+                        layer_k_head,
+                        layer_v_head,
                         node_ranges,
                         current_query,
                         t,
