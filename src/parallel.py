@@ -233,11 +233,9 @@ def htree_compute_scores_and_select_kernel(
     cos_cache, sin_cache,  # [cache_size, K//2]
     # 输出 buffer
     all_scores,  # [B, T, H, MAX_CANDIDATES]
-    all_node_indices,  # [B, T, H, MAX_CANDIDATES]
     num_candidates,  # [B, T, H]
     # 输出 Top-K
     topk_positions,  # [B, T, H, TOP_K]
-    selected_indices,  # [B, T, H, TOP_K]
     # 参数
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
@@ -271,6 +269,8 @@ def htree_compute_scores_and_select_kernel(
     # ========================================
     
     rightmost_idx = i_t // layer_power
+    rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
+    rightmost_child_idx = rightmost_idx % COMPRESSION_RATE
     
     T_i64 = T.to(tl.int64)
     prev_sel_base = (
@@ -326,7 +326,7 @@ def htree_compute_scores_and_select_kernel(
     # 阶段 3: 批次遍历，加载 K 并计算 scores，同时维护 Streaming Top-K
     # ========================================
 
-    # NOTE: all_scores/all_node_indices are [B, T, H, MAX_CANDIDATES]. When T*H*MAX_CANDIDATES
+    # NOTE: all_scores is [B, T, H, MAX_CANDIDATES]. When T*H*MAX_CANDIDATES
     # exceeds 2^31-1 (e.g., T=20000, H=16, MAX_CANDIDATES=8192), int32 offset math overflows and
     # can produce negative pointers, causing illegal memory access. Promote to int64 explicitly.
     buffer_base = (
@@ -372,25 +372,27 @@ def htree_compute_scores_and_select_kernel(
             (o_child_offset < num_valid_children_per_parent[:, None])
         )
         
+        # rightmost mask（用于强制选中最右节点）
+        rightmost_mask_2d = (
+            (parent_indices[:, None] == rightmost_parent_idx)
+            & (o_child_offset == rightmost_child_idx)
+            & valid_child_mask_2d
+        )
+
         # 初始化当前批次的结果
         scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], -1e10, dtype=tl.float32)
-        node_indices_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], -1, dtype=tl.int32)
         
         # 遍历 32 个父节点
-        for i_p in range(PARENTS_PER_BATCH):
+        for i_p in tl.static_range(PARENTS_PER_BATCH):
             parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
             
             if parent_idx >= 0:
                 child_start = parent_idx * COMPRESSION_RATE
                 rope_pos_start = i_batch * BC + i_p * COMPRESSION_RATE
-                
-                # 提取当前父节点的 valid mask
-                row_selector = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
-                current_parent_mask = tl.sum(
-                    tl.where(row_selector, valid_child_mask_2d.to(tl.int32), 0),
-                    axis=0
-                ).to(tl.int1)
-                num_valid_children = tl.sum(current_parent_mask.to(tl.int32))
+
+                # 当前父节点的有效子节点数
+                is_rightmost_parent_scalar = parent_idx == rightmost_parent_idx
+                num_valid_children = tl.where(is_rightmost_parent_scalar, rightmost_child_idx + 1, COMPRESSION_RATE)
                 
                 # 加载 K 并应用 RoPE (使用 GQA 映射的 i_h_kv)
                 k_rope_1, k_rope_2 = load_k_with_rope_v2(
@@ -403,9 +405,6 @@ def htree_compute_scores_and_select_kernel(
                 scores_16 = tl.sum(q_rope_1[None, :] * k_rope_1, axis=1) + \
                            tl.sum(q_rope_2[None, :] * k_rope_2, axis=1)
                 
-                # 计算全局节点索引
-                node_indices_16 = child_start + tl.arange(0, COMPRESSION_RATE)
-                
                 # 填充到 2D 结果
                 is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
                 scores_2d = tl.where(
@@ -413,20 +412,14 @@ def htree_compute_scores_and_select_kernel(
                     scores_16[None, :],
                     scores_2d
                 )
-                node_indices_2d = tl.where(
-                    is_current_parent & valid_child_mask_2d,
-                    node_indices_16[None, :],
-                    node_indices_2d
-                )
         
         # Flatten 到 [BC=512]
         batch_scores = tl.reshape(scores_2d, [BC])
-        batch_node_indices = tl.reshape(node_indices_2d, [BC])
         valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
+        rightmost_mask_flat = tl.reshape(rightmost_mask_2d, [BC])
         
         # 应用 mask
         batch_scores = tl.where(valid_child_mask_flat, batch_scores, -1e10)
-        batch_node_indices = tl.where(valid_child_mask_flat, batch_node_indices, -1)
         
         # 3.2 存储到 8192 buffer (供 Kernel 2.2 使用)
         buffer_offset = i_batch * BC
@@ -434,14 +427,12 @@ def htree_compute_scores_and_select_kernel(
         store_mask = (buffer_offset + o_bc) < MAX_CANDIDATES
         
         tl.store(all_scores + buffer_base + buffer_offset + o_bc, batch_scores, mask=store_mask)
-        tl.store(all_node_indices + buffer_base + buffer_offset + o_bc, batch_node_indices, mask=store_mask)
         
         # 3.3 Streaming Top-K Update (非底层)
         if not is_bottom_layer:
             # 3.3.1 预处理当前批次分数
             # 右侧节点强制选中
-            is_rightmost = (batch_node_indices == rightmost_idx)
-            batch_scores_k = tl.where(is_rightmost, 1e3, batch_scores)
+            batch_scores_k = tl.where(rightmost_mask_flat, 1e3, batch_scores)
             
             # Padding for invalid nodes
             batch_scores_k = tl.where(valid_child_mask_flat, batch_scores_k, -1e10)
@@ -510,32 +501,7 @@ def htree_compute_scores_and_select_kernel(
         is_valid_score = clean_scores > -0.9e10
         topk_buffer_positions = tl.where(is_valid_score, topk_buffer_positions, -1)
         
-        # 4.2 提取全局节点索引
-        gather_mask = topk_buffer_positions >= 0
-        selected_node_indices = tl.load(
-            all_node_indices + buffer_base + topk_buffer_positions,
-            mask=gather_mask,
-            other=-1,
-        )
-
-        # 4.3 对 selected_node_indices 进行升序排序（传给下一层）
-        MAX_IDX: tl.constexpr = 2147483647
-        selected_node_indices_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
-
-        n_dims_topk: tl.constexpr = 9  # log2(512) = 9
-        dummy_indices = tl.arange(0, TOP_K).to(tl.int32)
-        selected_node_indices_sorted, _ = argsort_v2(
-            selected_node_indices_sorted, dummy_indices, 
-            n_dims_topk, 1, 
-            descending=False
-        )
-
-        selected_node_indices_sorted = tl.where(
-            selected_node_indices_sorted < MAX_IDX,
-            selected_node_indices_sorted, -1
-        )
-
-        # 4.4 存储结果
+        # 4.3 存储结果
         topk_offset = (
             i_b.to(tl.int64) * T_i64 * H * TOP_K
             + i_t.to(tl.int64) * H * TOP_K
@@ -544,7 +510,6 @@ def htree_compute_scores_and_select_kernel(
         o_topk = tl.arange(0, TOP_K)
         
         tl.store(topk_positions + topk_offset + o_topk, topk_buffer_positions)
-        tl.store(selected_indices + topk_offset + o_topk, selected_node_indices_sorted.to(tl.int32))
     
     else:
         # 底层：跳过排序，输出 -1
@@ -556,7 +521,73 @@ def htree_compute_scores_and_select_kernel(
         o_topk = tl.arange(0, TOP_K)
         
         tl.store(topk_positions + topk_offset + o_topk, tl.full([TOP_K], -1, dtype=tl.int32))
-        tl.store(selected_indices + topk_offset + o_topk, tl.full([TOP_K], -1, dtype=tl.int32))
+
+
+# ==========================================
+# Post Kernel: Compute Next-Layer Parents
+# ==========================================
+
+@triton.jit
+def htree_compute_next_parents_kernel(
+    prev_selected_parents,  # [B, T, H, TOP_K]
+    topk_positions,  # [B, T, H, TOP_K]  (buffer positions from Kernel 2.1)
+    next_selected_parents,  # [B, T, H, TOP_K]
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    COMPRESSION_RATE: tl.constexpr,
+    TOP_K: tl.constexpr,
+):
+    """Compute next layer's prev_selected_parents from (prev_selected_parents, topk_positions).
+
+    Grid: (T, B*H)
+    """
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    BC: tl.constexpr = TOP_K  # 512
+    PARENTS_PER_BATCH: tl.constexpr = 32
+
+    T_i64 = T.to(tl.int64)
+    base = (
+        i_b.to(tl.int64) * T_i64 * H * TOP_K
+        + i_t.to(tl.int64) * H * TOP_K
+        + i_h.to(tl.int64) * TOP_K
+    )
+
+    o_topk = tl.arange(0, TOP_K)
+    pos_i32 = tl.load(topk_positions + base + o_topk)
+    gather_mask = pos_i32 >= 0
+
+    pos_i64 = pos_i32.to(tl.int64)
+    batch_id = (pos_i64 // BC).to(tl.int64)
+    within_batch = (pos_i64 - batch_id * BC).to(tl.int64)
+    parent_slot = (within_batch // COMPRESSION_RATE).to(tl.int64)
+    child_slot = (within_batch - parent_slot * COMPRESSION_RATE).to(tl.int64)
+
+    parent_idx = tl.load(
+        prev_selected_parents + base + batch_id * PARENTS_PER_BATCH + parent_slot,
+        mask=gather_mask,
+        other=-1,
+    )
+    selected_node_indices = tl.where(
+        gather_mask & (parent_idx >= 0),
+        (parent_idx.to(tl.int64) * COMPRESSION_RATE + child_slot).to(tl.int32),
+        -1,
+    )
+
+    # Sort ascending for next layer
+    MAX_IDX: tl.constexpr = 2147483647
+    selected_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
+
+    n_dims_topk: tl.constexpr = 9  # log2(512)
+    dummy = tl.arange(0, TOP_K).to(tl.int32)
+    selected_sorted, _ = argsort_v2(selected_sorted, dummy, n_dims_topk, 1, descending=False)
+    selected_sorted = tl.where(selected_sorted < MAX_IDX, selected_sorted, -1)
+
+    tl.store(next_selected_parents + base + o_topk, selected_sorted.to(tl.int32))
 
 
 # ==========================================
@@ -698,6 +729,7 @@ def htree_accumulate_non_topk_kernel(
                 child_candidate_mask = child_valid_mask & (global_pos < n_cand)
                 
                 # 非底层则剔除 top-k
+                # TODO one of the bottlenecks
                 if not is_bottom_layer:
                     # 检测当前子节点位置是否命中 Top-K
                     topk_hit = tl.sum(global_pos[:, None] == topk_pos_vals[None, :], axis=1).to(tl.int1)
@@ -942,7 +974,7 @@ def sort_single(
     return x
 
 
-# -------------------- 双数组排序 (用于 selected_indices 升序排序) --------------------
+# -------------------- 双数组排序 (用于 parents 升序排序) --------------------
 
 @triton.jit
 def _compare_and_swap_v2(
@@ -1148,10 +1180,8 @@ def htree_forward_v2(
     # per-layer reusable workspaces (aligned with parallel.py)
     MAX_CANDIDATES = 8192
     all_scores = torch.empty([B, T, H, MAX_CANDIDATES], dtype=torch.float32, device=device)
-    all_node_indices = torch.empty([B, T, H, MAX_CANDIDATES], dtype=torch.int32, device=device)
     num_candidates = torch.empty([B, T, H], dtype=torch.int32, device=device)
     topk_positions = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
-    selected_indices = torch.empty([B, T, H, top_k_per_layer], dtype=torch.int32, device=device)
     
      # 为最顶层初始化 prev_selected_parents
     top_layer_power = compression_rate ** (num_layers - 1)
@@ -1193,8 +1223,8 @@ def htree_forward_v2(
             q, k_layer,
             prev_selected_parents,
             cos_cache, sin_cache,
-            all_scores, all_node_indices, num_candidates,
-            topk_positions, selected_indices,
+            all_scores, num_candidates,
+            topk_positions,
             layer_idx=layer_idx,
             layer_power=layer_power,
             B=B, T=T, H=H, H_kv=H_kv,
@@ -1264,9 +1294,35 @@ def htree_forward_v2(
         
         nvtx.range_pop()
 
-        # 更新 parent indices
+        # 更新 parent indices（用当前层 prev_selected_parents + topk_positions 计算下一层 parents）
         if not is_bottom_layer:
-            prev_selected_parents, selected_indices = selected_indices, prev_selected_parents
+            nvtx.range_push("Post_ComputeNextParents")
+
+            print("    Running compute next parents kernel...")
+            torch.cuda.synchronize()
+            start_k24 = torch.cuda.Event(enable_timing=True)
+            end_k24 = torch.cuda.Event(enable_timing=True)
+            start_k24.record()
+
+            htree_compute_next_parents_kernel[grid](
+                prev_selected_parents,
+                topk_positions,
+                topk_positions,
+                B=B, T=T, H=H,
+                COMPRESSION_RATE=compression_rate,
+                TOP_K=top_k_per_layer,
+            )
+
+            end_k24.record()
+            torch.cuda.synchronize()
+            time_k24 = start_k24.elapsed_time(end_k24)
+            print(f"      Kernel 2.4 time: {time_k24:.2f} ms")
+
+            nvtx.range_pop()
+
+            # Swap buffers: topk_positions now holds next prev_selected_parents.
+            # Reuse old prev_selected_parents buffer as the next iteration's topk_positions output.
+            prev_selected_parents, topk_positions = topk_positions, prev_selected_parents
         
         nvtx.range_pop()
     nvtx.range_pop()

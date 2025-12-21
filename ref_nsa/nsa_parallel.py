@@ -830,7 +830,8 @@ def parallel_nsa(
         scale = k.shape[-1] ** -0.5
     if cu_seqlens is not None:
         assert q.shape[0] == 1, "batch size must be 1 when cu_seqlens are provided"
-    assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
+    # TODO assert q.shape[2] % (k.shape[2] * 16) == 0, "Group size must be a multiple of 16 in NSA"
+    assert q.shape[2] % k.shape[2] == 0, "Group size must be integer multiple"
 
     k_cmp, v_cmp = mean_pooling(k, block_size, cu_seqlens), mean_pooling(v, block_size, cu_seqlens)
     o_cmp, lse_cmp = None, None

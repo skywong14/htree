@@ -11,12 +11,6 @@ import torch
 from src.parallel import htree_forward_v2
 from src.naive_stable_topk import forward_kernel as naive_forward
 
-
-def _cuda_sync_if_needed(device: str) -> None:
-    if device == "cuda":
-        torch.cuda.synchronize()
-
-
 def _warmup_triton(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -27,11 +21,11 @@ def _warmup_triton(
     top_k_per_layer: int,
     scale: float,
     warmup_iters: int,
-    device: str,
+    device: torch.device,
 ) -> None:
     if warmup_iters <= 0:
         return
-    if device != "cuda":
+    if device.type != "cuda":
         # Triton only runs on CUDA; keep behavior explicit.
         return
 
@@ -50,11 +44,20 @@ def _warmup_triton(
     print("[Warmup] Triton 预热完成。\n")
 
 
-def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = True):
+def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = True, gpu: int = 0):
     """测试所有位置的输出结果"""
     # 设置随机种子保证可重现
     torch.manual_seed(42)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    if torch.cuda.is_available():
+        if gpu < 0:
+            raise ValueError(f"--gpu must be >= 0, got {gpu}")
+        if torch.cuda.device_count() <= gpu:
+            raise ValueError(f"Requested --gpu {gpu}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
+        torch.cuda.set_device(gpu)
+        device = torch.device(f"cuda:{gpu}")
+    else:
+        device = torch.device("cpu")
     
     # 测试配置
     # GQA Configuration: H (Query Heads), H_kv (KV Heads)
@@ -252,10 +255,19 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
         print("="*80)
         return True
 
+def _cuda_sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 if __name__ == "__main__":
     try:
         parser = argparse.ArgumentParser(description="All-positions correctness test for stable top-k (naive vs triton).")
+        parser.add_argument(
+            "--gpu",
+            type=int,
+            default=0,
+            help="CUDA device index to use (after CUDA_VISIBLE_DEVICES remapping). Ignored if CUDA is unavailable.",
+        )
         parser.add_argument(
             "--warmup-triton-iters",
             type=int,
@@ -269,7 +281,11 @@ if __name__ == "__main__":
         )
         args = parser.parse_args()
 
-        success = test_all_positions(warmup_triton_iters=args.warmup_triton_iters, compare_naive=(not args.no_compare))
+        success = test_all_positions(
+            warmup_triton_iters=args.warmup_triton_iters,
+            compare_naive=(not args.no_compare),
+            gpu=args.gpu,
+        )
         sys.exit(0 if success else 1)
     except Exception as e:
         print(f"\n测试执行失败: {e}")
