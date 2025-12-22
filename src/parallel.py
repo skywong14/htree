@@ -268,7 +268,6 @@ def htree_compute_scores_and_select_kernel(
     MAX_CANDIDATES: tl.constexpr,
     SCORE_VALID_THRESHOLD: tl.constexpr,
     scale,
-    BLOCK_SIZE_Q: tl.constexpr,
 ):
     """
     Kernel 2.1: 计算所有候选节点的 attention scores，并选出 Top-K
