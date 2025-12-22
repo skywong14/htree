@@ -12,10 +12,15 @@ Pipeline
         · 32 父 × 16 子批次遍历，RoPE 后写入固定 8192 buffer (scores & indices)
         · 非底层：将最右节点分数置 1e3，Bit-Packing 编码 buffer 位置并做单数组 bitonic 排序 → 稳定 Top-K
         · 底层跳过排序，topk_positions/selected_indices 置 -1
+    - Kernel 2.1.2 mask_topk_scores:
+        · 将 Top-K 对应的 buffer 位置分数写为 -1e10，用于在 Kernel 2.2 中免去 topk_hit 广播比较
     - Kernel 2.2 accumulate_non_topk:
         · 按原批次顺序流式加载 V，基于 topk_positions 构建 mask，仅累积非 Top-K；底层累积全部
     - Kernel 2.3 merge_to_global_v2:
         · 在线 Softmax 合并当前层累计到全局状态
+    - Kernel 2.4 compute_next_parents (原先在 Kernel 2.1 内部的逻辑拆分出来):
+        · 将 Kernel 2.1 输出的 topk_positions（buffer 位置）映射回下一层的 parent indices
+        · 对下一层 parents 做升序排序，作为下一层 Kernel 2.1 的输入 prev_selected_parents
 
   Phase 3: Final Normalize (htree_final_normalize_kernel_v2)
     - output = global_output / global_sum
@@ -26,6 +31,20 @@ import torch
 import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
+
+# ==========================================
+# 全局常量（数值约定）
+# ==========================================
+
+# 作为“负无穷/被屏蔽”的统一 sentinel 分数。
+# 关系：所有被屏蔽/无效位置的 score 必须 <= HTREE_SCORE_NEG_INF。
+HTREE_SCORE_NEG_INF: float = -1.0e10
+
+# 判定 score 是否“有效”的阈值。
+# 关系：HTREE_SCORE_VALID_THRESHOLD 必须严格大于 HTREE_SCORE_NEG_INF，
+# 从而能用 `score > HTREE_SCORE_VALID_THRESHOLD` 区分出被屏蔽(-1e10)的项。
+# 这里沿用原实现的经验值：-0.9e10。
+HTREE_SCORE_VALID_THRESHOLD: float = HTREE_SCORE_NEG_INF * 0.9
 
 # ==========================================
 # Kernel 1: Tree Building
@@ -229,13 +248,13 @@ def load_v_v2(
 def htree_compute_scores_and_select_kernel(
     q,  # [B, T, H, K]
     layer_k,  # [B, N_layer, H_kv, K]
-    prev_selected_parents,  # [B, T, H, TOP_K]
+    prev_selected_parents,  # [B, T_blocks, H, TOP_K]
     cos_cache, sin_cache,  # [cache_size, K//2]
     # 输出 buffer
     all_scores,  # [B, T, H, MAX_CANDIDATES]
     num_candidates,  # [B, T, H]
     # 输出 Top-K
-    topk_positions,  # [B, T, H, TOP_K]
+    topk_positions,  # [B, T_blocks, H, TOP_K]
     # 参数
     layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
@@ -247,7 +266,9 @@ def htree_compute_scores_and_select_kernel(
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
     MAX_CANDIDATES: tl.constexpr,
+    SCORE_VALID_THRESHOLD: tl.constexpr,
     scale,
+    BLOCK_SIZE_Q: tl.constexpr,
 ):
     """
     Kernel 2.1: 计算所有候选节点的 attention scores，并选出 Top-K
@@ -261,8 +282,10 @@ def htree_compute_scores_and_select_kernel(
     i_h_kv = i_h // NUM_GROUPS
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
-    BC: tl.constexpr = TOP_K  # 512
     PARENTS_PER_BATCH: tl.constexpr = 32
+    # Per-batch candidates: 32 parents × COMPRESSION_RATE children.
+    # This is 512 when COMPRESSION_RATE=16.
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
     
     # ========================================
     # 阶段 1: 确定候选节点范围
@@ -336,9 +359,8 @@ def htree_compute_scores_and_select_kernel(
     )
     
     # 3.1 初始化 Streaming Top-K 容器 (encoded scores)
-    # 我们维护一个大小为 TOP_K 的已排序(encoded)数组
-    # 初始化为极小值 (encoded padding)
-    running_topk_encoded = tl.full([TOP_K], -1e10, dtype=tl.float32)
+    # 内部维护一个大小为 BC(=32*COMPRESSION_RATE) 的已排序(encoded)数组，最后只写出前 TOP_K。
+    running_topk_encoded = tl.full([BC], -1e10, dtype=tl.float32)
     
     # Bit-Packing 常量
     LOG_N: tl.constexpr = 13  # log2(8192) = 13
@@ -354,8 +376,7 @@ def htree_compute_scores_and_select_kernel(
         )  # [32]
         
         valid_parent_mask = parent_indices >= 0
-        child_starts = parent_indices * COMPRESSION_RATE
-        child_starts = tl.where(valid_parent_mask, child_starts, 0)
+        child_starts = tl.where(valid_parent_mask, parent_indices * COMPRESSION_RATE, 0)
         
         # 判断最右侧父节点
         is_rightmost_parent = (child_starts // COMPRESSION_RATE == rightmost_idx // COMPRESSION_RATE)
@@ -485,9 +506,12 @@ def htree_compute_scores_and_select_kernel(
     # ========================================
     
     if not is_bottom_layer:
-        # running_topk_encoded 包含了全局 Top-K 的编码分数
-        
-        # 4.1 Bit-Packing 解码
+        # running_topk_encoded 包含了全局 Top-BC 的编码分数，写出前 TOP_K 个。
+        # NOTE: Avoid advanced indexing (running_topk_encoded[o]) which is not supported in some Triton versions.
+
+        o_bc = tl.arange(0, BC)
+
+        # 4.1 Bit-Packing 解码 (decode full BC, store first TOP_K)
         sorted_int = running_topk_encoded.to(tl.int32, bitcast=True)
         raw_idx = sorted_int & idx_mask
         clean_int = sorted_int & ~idx_mask
@@ -498,7 +522,7 @@ def htree_compute_scores_and_select_kernel(
         topk_buffer_positions = (topk_buffer_positions & idx_mask).to(tl.int32)
         
         # 过滤 Padding 值 (score <= -0.9e10)
-        is_valid_score = clean_scores > -0.9e10
+        is_valid_score = clean_scores > SCORE_VALID_THRESHOLD
         topk_buffer_positions = tl.where(is_valid_score, topk_buffer_positions, -1)
         
         # 4.3 存储结果
@@ -507,9 +531,9 @@ def htree_compute_scores_and_select_kernel(
             + i_t.to(tl.int64) * H * TOP_K
             + i_h.to(tl.int64) * TOP_K
         )
-        o_topk = tl.arange(0, TOP_K)
-        
-        tl.store(topk_positions + topk_offset + o_topk, topk_buffer_positions)
+        store_mask = o_bc < TOP_K
+        safe_offsets = tl.where(store_mask, o_bc, 0)
+        tl.store(topk_positions + topk_offset + safe_offsets, topk_buffer_positions, mask=store_mask)
     
     else:
         # 底层：跳过排序，输出 -1
@@ -547,8 +571,8 @@ def htree_compute_next_parents_kernel(
     i_b = i_bh // H
     i_h = i_bh % H
 
-    BC: tl.constexpr = TOP_K  # 512
     PARENTS_PER_BATCH: tl.constexpr = 32
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # 512 when COMPRESSION_RATE=16
 
     T_i64 = T.to(tl.int64)
     base = (
@@ -591,6 +615,49 @@ def htree_compute_next_parents_kernel(
 
 
 # ==========================================
+# Kernel 2.1.2: Mask Top-K Scores in Buffer
+# ==========================================
+
+@triton.jit
+def htree_mask_topk_scores_kernel(
+    all_scores,  # [B, T, H, MAX_CANDIDATES]
+    topk_positions,  # [B, T, H, TOP_K] (buffer positions)
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    TOP_K: tl.constexpr,
+    MAX_CANDIDATES: tl.constexpr,
+    NEG_INF: tl.constexpr,
+):
+    """Mask Top-K scores by overwriting them with NEG_INF.
+
+    Grid: (T, B*H)
+    """
+    i_t = tl.program_id(0)
+    i_bh = tl.program_id(1)
+    i_b = i_bh // H
+    i_h = i_bh % H
+
+    T_i64 = T.to(tl.int64)
+    topk_base = (
+        i_b.to(tl.int64) * T_i64 * H * TOP_K
+        + i_t.to(tl.int64) * H * TOP_K
+        + i_h.to(tl.int64) * TOP_K
+    )
+    o_topk = tl.arange(0, TOP_K)
+    pos_i32 = tl.load(topk_positions + topk_base + o_topk)
+    valid = (pos_i32 >= 0) & (pos_i32 < MAX_CANDIDATES)
+
+    buffer_base = (
+        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
+        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+        + i_h.to(tl.int64) * MAX_CANDIDATES
+    )
+    ptrs = all_scores + buffer_base + pos_i32.to(tl.int64)
+    tl.store(ptrs, tl.full([TOP_K], NEG_INF, dtype=tl.float32), mask=valid)
+
+
+# ==========================================
 # Kernel 2.2: Accumulate Non-TopK (批次加载 V)
 # ==========================================
 
@@ -610,7 +677,6 @@ def htree_accumulate_non_topk_kernel(
     # Kernel 2.1 的输出
     all_scores,  # [B, T, H, MAX_CANDIDATES]
     num_candidates,  # [B, T, H]
-    topk_positions,  # [B, T, H, TOP_K]
     # 输出
     layer_max,  # [B, T, H]
     layer_sum,  # [B, T, H]
@@ -626,6 +692,7 @@ def htree_accumulate_non_topk_kernel(
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
     MAX_CANDIDATES: tl.constexpr,
+    SCORE_VALID_THRESHOLD: tl.constexpr,
 ):
     """
     Kernel 2.2: 流式加载 V，累积非 Top-K 节点（Stream Accumulate）
@@ -639,8 +706,8 @@ def htree_accumulate_non_topk_kernel(
     i_h_kv = i_h // NUM_GROUPS
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
-    BC: tl.constexpr = TOP_K  # 512
     PARENTS_PER_BATCH: tl.constexpr = 32
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # 512 when COMPRESSION_RATE=16
     
     rightmost_idx = i_t // layer_power
     
@@ -655,14 +722,6 @@ def htree_accumulate_non_topk_kernel(
         + i_h.to(tl.int64)
     )
     n_cand = tl.load(num_candidates + num_cand_offset)
-    
-    topk_offset = (
-        i_b.to(tl.int64) * T_i64 * H * TOP_K
-        + i_t.to(tl.int64) * H * TOP_K
-        + i_h.to(tl.int64) * TOP_K
-    )
-    o_topk = tl.arange(0, TOP_K)
-    topk_pos_vals = tl.load(topk_positions + topk_offset + o_topk) # topk_pos_vals [TOP_K] 内容为 buffer 中的下标位置（乱序）
     
     # Same overflow issue as Kernel 2.1: promote linear indexing to int64.
     buffer_base = (
@@ -728,21 +787,19 @@ def htree_accumulate_non_topk_kernel(
                 # 候选有效性（不超过实际候选数且子节点有效）
                 child_candidate_mask = child_valid_mask & (global_pos < n_cand)
                 
-                # 非底层则剔除 top-k
-                # TODO one of the bottlenecks
-                if not is_bottom_layer:
-                    # 检测当前子节点位置是否命中 Top-K
-                    topk_hit = tl.sum(global_pos[:, None] == topk_pos_vals[None, :], axis=1).to(tl.int1)
-                    final_child_mask = child_candidate_mask & (~topk_hit)
-                else:
-                    final_child_mask = child_candidate_mask
-                
                 # 加载当前子节点的 scores [16]
                 child_scores = tl.load(
                     all_scores + buffer_base + global_pos,
                     mask=o_child < COMPRESSION_RATE,
                     other=-1e10
                 )
+
+                # 非底层：Top-K 位置已在 Kernel 2.1.2 中写成 -1e10，因此这里用 score_valid 过滤即可
+                if not is_bottom_layer:
+                    score_valid = child_scores > SCORE_VALID_THRESHOLD
+                    final_child_mask = child_candidate_mask & score_valid
+                else:
+                    final_child_mask = child_candidate_mask
                 
                 # 应用 mask
                 masked_scores = tl.where(final_child_mask, child_scores, -1e10)
@@ -1084,6 +1141,12 @@ def htree_forward_v2(
     # 验证 GQA 配置
     assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"
     assert k.shape[2] == v.shape[2], f"K and V must have same number of heads"
+
+    # This implementation uses a fixed per-batch candidate tile of 32*compression_rate.
+    # top_k_per_layer controls how many nodes are expanded to the next layer.
+    assert top_k_per_layer <= 32 * compression_rate, (
+        f"top_k_per_layer ({top_k_per_layer}) must be <= 32*compression_rate ({32 * compression_rate})"
+    )
     
     if scale is None:
         scale = K ** -0.5
@@ -1233,6 +1296,7 @@ def htree_forward_v2(
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,
+            SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
             scale=scale,
         )
         end_k21.record()
@@ -1241,6 +1305,31 @@ def htree_forward_v2(
         print(f"      Kernel 2.1 time: {time_k21:.2f} ms")
         
         nvtx.range_pop()
+
+        # Kernel 2.1.2: Mask Top-K scores in all_scores (non-bottom layers only)
+        if not is_bottom_layer:
+            nvtx.range_push("K2.1.2_MaskTopKScores")
+            print("    Running mask topk scores kernel...")
+
+            torch.cuda.synchronize()
+            start_k212 = torch.cuda.Event(enable_timing=True)
+            end_k212 = torch.cuda.Event(enable_timing=True)
+            start_k212.record()
+
+            htree_mask_topk_scores_kernel[grid](
+                all_scores,
+                topk_positions,
+                B=B, T=T, H=H,
+                TOP_K=top_k_per_layer,
+                MAX_CANDIDATES=MAX_CANDIDATES,
+                NEG_INF=HTREE_SCORE_NEG_INF,
+            )
+
+            end_k212.record()
+            torch.cuda.synchronize()
+            time_k212 = start_k212.elapsed_time(end_k212)
+            print(f"      Kernel 2.1.2 time: {time_k212:.2f} ms")
+            nvtx.range_pop()
         
         # Kernel 2.2: Accumulate Non-TopK
         nvtx.range_push("K2.2_AccumulateNonTopK")
@@ -1255,7 +1344,6 @@ def htree_forward_v2(
             v_layer,
             prev_selected_parents,
             all_scores, num_candidates,
-            topk_positions,
             layer_max, layer_sum, layer_output,
             layer_idx=layer_idx,
             layer_power=layer_power,
@@ -1265,6 +1353,7 @@ def htree_forward_v2(
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,
+            SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
         )
         end_k22.record()
         torch.cuda.synchronize()
@@ -1359,6 +1448,8 @@ __all__ = [
     'htree_forward_v2',
     'htree_build_kernel_v2',
     'htree_compute_scores_and_select_kernel',
+    'htree_compute_next_parents_kernel',
+    'htree_mask_topk_scores_kernel',
     'htree_accumulate_non_topk_kernel',
     'htree_merge_to_global_kernel_v2',
     'htree_final_normalize_kernel_v2',
