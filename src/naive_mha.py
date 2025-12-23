@@ -76,6 +76,156 @@ def apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> t
     return torch.cat([y1, y2], dim=-1)
 
 
+# ==========================================
+# Bit-Packing Top-K 辅助函数
+# ==========================================
+
+def bitpack_encode(scores: torch.Tensor, indices: torch.Tensor, log_n: int = 13) -> torch.Tensor:
+    """
+    将 buffer 位置索引编码到 float32 分数的低位。
+    
+    与 Triton 实现一致的 Bit-Packing 编码：
+    - 正数：取反索引 (~idx)，使小索引在数值相同时排在前面（稳定排序）
+    - 负数：保持索引原值
+    
+    Args:
+        scores: [N] float32 分数
+        indices: [N] int32 buffer 位置索引 (0 到 N-1)
+        log_n: 索引位数 (13 for N=8192)
+    
+    Returns:
+        encoded_scores: [N] float32 编码后的分数
+    """
+    idx_mask = (1 << log_n) - 1  # 0x1FFF for log_n=13
+    
+    # 将 float32 视为 int32
+    scores_int = scores.view(torch.int32)
+    
+    # TODO
+    # 手动清空尾数的第14位（bit 13，从0开始计数）
+    # bit_13_mask = ~(1 << 13)  # 创建一个只有 bit 13 为 0 的掩码
+    # scores_int = scores_int & bit_13_mask
+    
+    # 编码索引：正数取反，负数保持
+    encoded_idx = torch.where(
+        scores >= 0,
+        ~indices.to(torch.int32),
+        indices.to(torch.int32)
+    )
+    encoded_idx = encoded_idx & idx_mask
+    
+    # 清除 float32 低位，填入编码索引
+    scores_encoded_int = (scores_int & ~idx_mask) | encoded_idx
+    
+    return scores_encoded_int.view(torch.float32)
+
+
+def bitpack_decode(sorted_encoded_scores: torch.Tensor, log_n: int = 13) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    从编码后的排序结果中解码出原始 buffer 位置和清理后的分数。
+    
+    Args:
+        sorted_encoded_scores: [N] float32 排序后的编码分数
+        log_n: 索引位数 (13 for N=8192)
+    
+    Returns:
+        buffer_positions: [N] int32 原始 buffer 位置
+        clean_scores: [N] float32 清理后的分数（低位置零）
+    """
+    idx_mask = (1 << log_n) - 1  # 0x1FFF for log_n=13
+    
+    # 转为 int32
+    sorted_int = sorted_encoded_scores.view(torch.int32)
+    
+    # 提取编码的索引（低 log_n 位）
+    raw_idx = sorted_int & idx_mask
+    
+    # 清除低位恢复分数
+    clean_int = sorted_int & ~idx_mask
+    clean_scores = clean_int.view(torch.float32)
+    
+    # 还原索引：正数时索引被取反了，需要再次取反
+    buffer_positions = torch.where(
+        clean_scores >= 0,
+        ~raw_idx,
+        raw_idx
+    )
+    buffer_positions = (buffer_positions & idx_mask).to(torch.int32)
+    
+    return buffer_positions, clean_scores
+
+
+def stable_topk_with_bitpacking(
+    scores: torch.Tensor,
+    k: int,
+    rightmost_idx: int,
+    candidate_indices: torch.Tensor,
+    log_n: int = 13
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    使用 Bit-Packing 技术进行稳定的 Top-K 选择。
+    
+    与 Triton 实现完全一致的流程：
+    1. 给 rightmost 节点设置高分 (1e3) 确保被选中
+    2. Bit-Packing 编码
+    3. 降序排序
+    4. 解码提取 Top-K 的 buffer 位置
+    5. 根据 buffer 位置获取全局节点索引
+    
+    Args:
+        scores: [num_cand] float32 候选节点分数
+        k: Top-K 数量
+        rightmost_idx: 最右侧节点的全局索引
+        candidate_indices: [num_cand] 候选节点的全局索引
+        log_n: 索引位数
+    
+    Returns:
+        topk_buffer_positions: [k] Top-K 在 buffer 中的位置（用于创建 mask）
+        selected_node_indices_sorted: [k] Top-K 的全局节点索引（升序排序，传给下一层）
+    """
+    # 由于 bit-packing 需要直接 view int32，这里统一使用 float32 进行编码/排序，避免 FP16/BF16 的 view 报错。
+    scores_fp32 = scores.float()
+
+    num_cand = scores_fp32.numel()
+    device = scores.device
+    actual_k = min(k, num_cand)
+    
+    # 1. 给 rightmost 节点设置高分
+    is_rightmost = (candidate_indices == rightmost_idx)
+    scores_modified = torch.where(
+        is_rightmost,
+        torch.tensor(1e3, device=device, dtype=torch.float32),
+        scores_fp32
+    )
+    
+    # 2. Bit-Packing 编码
+    buffer_indices = torch.arange(num_cand, device=device, dtype=torch.int32)
+    encoded_scores = bitpack_encode(scores_modified, buffer_indices, log_n)
+    
+    # 3. 降序排序
+    sorted_encoded_scores, _ = torch.sort(encoded_scores, descending=True)
+    
+    # 4. 解码
+    buffer_positions, _ = bitpack_decode(sorted_encoded_scores, log_n)
+    
+    # 5. 提取前 K 个的 buffer 位置
+    topk_buffer_positions = buffer_positions[:actual_k]
+    
+    # 6. 根据 buffer 位置获取全局节点索引
+    selected_node_indices = candidate_indices[topk_buffer_positions.long()]
+    
+    # 7. 对全局节点索引升序排序（传给下一层）
+    selected_node_indices_sorted, _ = torch.sort(selected_node_indices)
+    
+    # Padding to k if needed
+    if actual_k < k:
+        padding = torch.full([k - actual_k], -1, dtype=torch.int32, device=device)
+        topk_buffer_positions = torch.cat([topk_buffer_positions, padding])
+        selected_node_indices_sorted = torch.cat([selected_node_indices_sorted, padding])
+    
+    return topk_buffer_positions, selected_node_indices_sorted
+
+
 def build_tree(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -86,18 +236,18 @@ def build_tree(
     Build hierarchical structure of htree.
 
     Args:
-        k: [B, T, H, D]
-        v: [B, T, H, D]
+        k: [B, T, H_kv, D]
+        v: [B, T, H_kv, D]
         compression_rate: Compression rate, 16.
         max_top_nodes: Maximum number of top nodes, 8192.
 
     Returns:
         layers: Hierarchical list, each element is (K_layer, V_layer, node_ranges)
-            - K_layer, V_layer: [B, N_nodes, H, D]
+            - K_layer, V_layer: [B, N_nodes, H_kv, D]
             - node_ranges: [N_nodes, 2] Each node covers the token range [start, end)
     """
     nvtx.range_push("BuildTree")
-    B, T, H, D = k.shape
+    B, T, H_kv, D = k.shape
     layers = []
     
     # TODO node_ranges也许没有必要，因为整个树的结构是唯一确定的
@@ -120,13 +270,13 @@ def build_tree(
         # padding
         pad_len = next_len * compression_rate - current_len
         if pad_len > 0:
-            current_k = F.pad(current_k, (0, 0, 0, 0, 0, pad_len))  # [B, next_len*compression_rate, H, D]
+            current_k = F.pad(current_k, (0, 0, 0, 0, 0, pad_len))  # [B, next_len*compression_rate, H_kv, D]
             current_v = F.pad(current_v, (0, 0, 0, 0, 0, pad_len))
         
         # Reshape & mean
-        # [B, next_len*compression_rate, H, D] -> [B, next_len, compression_rate, H, D] -> [B, next_len, H, D]
-        next_k = current_k.view(B, next_len, compression_rate, H, D).mean(dim=2)
-        next_v = current_v.view(B, next_len, compression_rate, H, D).mean(dim=2)
+        # [B, next_len*compression_rate, H_kv, D] -> [B, next_len, compression_rate, H_kv, D] -> [B, next_len, H_kv, D]
+        next_k = current_k.view(B, next_len, compression_rate, H_kv, D).mean(dim=2)
+        next_v = current_v.view(B, next_len, compression_rate, H_kv, D).mean(dim=2)
         
         # 节点范围: 每个父节点覆盖 compression_rate 个子节点的范围
         prev_ranges = layers[-1][2]  # [current_len, 2]
@@ -224,7 +374,7 @@ def compute_select_and_merge(
     Compute attention scores, select Top-K nodes, and merge non-selected nodes into softmax state.
     
     Args:
-        layer_k, layer_v: [1, N, 1, D] Single head data
+        layer_k, layer_v: [1, N, 1, D] Single head data (already mapped to correct KV head)
         node_ranges: [N, 2] Each node covers the token range [start, end)
         query: [1, 1, D] Single head query
         query_pos: query position m
@@ -263,16 +413,20 @@ def compute_select_and_merge(
     else:
         # 非顶层：只考虑上一层选中节点的子节点
         parents = prev_selected_parent_indices.reshape(-1)  # [M]
-        child_offsets = torch.arange(compression_rate, device=device)
-        children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
-        children = children[children < N]
-        
-        # 过滤：只保留左边界 ≤ m 的节点
-        valid_mask = node_ranges[:, 0] <= query_pos
-        valid_children = children[valid_mask[children]]
-        
-        candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        candidates_mask[valid_children] = True
+        parents = parents[parents >= 0]
+        if parents.numel() == 0:
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            child_offsets = torch.arange(compression_rate, device=device)
+            children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
+            children = children[children < N]
+
+            # 过滤：只保留左边界 ≤ m 的节点
+            valid_mask = node_ranges[:, 0] <= query_pos
+            valid_children = children[valid_mask[children]]
+
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            candidates_mask[valid_children] = True
     
     # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
     rightmost_idx = query_pos // (compression_rate ** layer_idx)
@@ -303,7 +457,7 @@ def compute_select_and_merge(
     # 计算注意力分数 (single head, no pooling)
     scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
     scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
-    
+
     # 确定参与在线Softmax的节点和选中的节点
     is_bottom_layer = (layer_idx == 0)
     if is_bottom_layer:
@@ -311,176 +465,61 @@ def compute_select_and_merge(
         merge_scores = scores_pooled.unsqueeze(0)  # [1, num_cand]
         merge_values = candidate_v  # [1, num_cand, 1, D]
         selected_indices = None
+        topk_buffer_positions = None
+        # 底层不需要编码，scores_pooled_encoded 与 scores_pooled 相同
+        scores_pooled_encoded = scores_pooled
     else:
-        # 非底层：使用 importance 选择 Top-K
-        # 计算当前最大分数（用于计算 importance）
-        cur_max = max(max_score.item(), scores_pooled.max().item())
+        # ================================================================
+        # 非底层：使用 Bit-Packing Top-K 选择（与 Triton 实现一致）
+        # ================================================================
         
-        # 计算 importance：最右侧节点 = 1.0，其他节点 = exp(score - cur_max)
+        # 将 position_id 编码到 scores_pooled 中（用于调试和可视化）
+        log_n = 13  # MAX_CANDIDATES = 8192, log2(8192) = 13
+        buffer_indices = torch.arange(num_candidates, device=device, dtype=torch.int32)
+        
+        # 给 rightmost 节点设置高分（与 Triton 一致）
         is_rightmost = (candidate_indices == rightmost_idx)
-        importance = torch.where(
+        scores_modified = torch.where(
             is_rightmost,
-            torch.tensor(1.0, device=device, dtype=scores_pooled.dtype),
-            torch.exp(scores_pooled - cur_max)
+            torch.tensor(1e3, device=device, dtype=torch.float32),
+            scores_pooled
         )
         
-        # 基于 importance 选择 Top-K
-        actual_top_k = min(top_k, num_candidates)
-        _, topk_local_idx = torch.topk(importance, actual_top_k, dim=0)  # [actual_top_k]
+        # Bit-Packing 编码
+        scores_pooled_encoded = bitpack_encode(scores_modified, buffer_indices, log_n)
+
+        # 使用 Bit-Packing 稳定 Top-K（注意：这里传入编码后的分数）
+        topk_buffer_positions, selected_node_indices_sorted = stable_topk_with_bitpacking(
+            scores_pooled,  # 内部会重新编码，所以这里还是传原始分数
+            top_k,
+            rightmost_idx,
+            candidate_indices,
+            log_n=log_n
+        )
         
-        # 被选中的节点掩码
+        # 被选中的节点掩码（基于 buffer 位置）
         selected_mask = torch.zeros(num_candidates, dtype=torch.bool, device=device)
-        selected_mask[topk_local_idx] = True
+        valid_positions = topk_buffer_positions[topk_buffer_positions >= 0]
+        selected_mask[valid_positions.long()] = True
         
-        # 未被选中的节点，参与计算（使用原始 score，不是 importance）
+        # 未被选中的节点，参与计算（使用原始 score）
         merge_mask = ~selected_mask
         merge_scores = scores_pooled[merge_mask].unsqueeze(0)  # [1, num_merge]
         merge_values = candidate_v[:, merge_mask]  # [1, num_merge, 1, D]
         
-        # 选中的节点索引
-        selected_indices = candidate_indices[topk_local_idx].unsqueeze(0)  # [1, actual_top_k]
+        # 选中的节点索引（升序排序，传给下一层）
+        selected_indices = selected_node_indices_sorted.unsqueeze(0)  # [1, top_k]
     
     # Online softmax merge
     max_score, sum_exp, weighted_output = online_softmax_merge(
         max_score, sum_exp, weighted_output, merge_scores, merge_values
     )
-    
+
     if return_debug_info:
-        return max_score, sum_exp, weighted_output, selected_indices, candidate_indices, scores_pooled
+        # 返回编码后的分数（包含 position_id），用于调试和可视化
+        return max_score, sum_exp, weighted_output, selected_indices, candidate_indices, scores_pooled_encoded
     else:
         return max_score, sum_exp, weighted_output, selected_indices
-
-
-def compute_and_select_only(
-    layer_k: torch.Tensor,
-    layer_v: torch.Tensor,
-    node_ranges: torch.Tensor,
-    query: torch.Tensor,
-    query_pos: int,
-    prev_selected_parent_indices: Optional[torch.Tensor],
-    compression_rate: int,
-    layer_idx: int,
-    rotary: Rotary,
-    max_score: torch.Tensor,
-    sum_exp: torch.Tensor,
-    weighted_output: torch.Tensor,
-    top_k: int = 512,
-    scale: Optional[float] = None
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """
-    Compute attention scores, select Top-K nodes, and merge ALL candidates into softmax state.
-    This simulates Kernel 2.1 behavior (before subtract_topk).
-    
-    Args:
-        Same as compute_select_and_merge
-    
-    Returns:
-        max_score: [1] Updated maximum score (after merging ALL candidates)
-        sum_exp: [1] Updated sum of exponentials (after merging ALL candidates)
-        weighted_output: [1, 1, D] Updated weighted output (after merging ALL candidates)
-        selected_indices: [1, top_k] Selected node indices for next layer (None for bottom layer)
-        topk_indices_unsorted: [top_k] Top-K indices in importance order (padded with -1)
-        topk_scores_unsorted: [top_k] Top-K scores in importance order
-    """
-    B, N, H, D = layer_k.shape
-    device = layer_k.device
-    
-    assert B == 1 and H == 1, "This function processes single head data"
-    
-    if scale is None:
-        scale = D ** -0.5
-    
-    # 确定候选节点范围
-    if prev_selected_parent_indices is None:
-        # 顶层：考虑所有左边界 ≤ m 的节点
-        candidates_mask = node_ranges[:, 0] <= query_pos
-    else:
-        # 非顶层：只考虑上一层选中节点的子节点
-        parents = prev_selected_parent_indices.reshape(-1)  # [M]
-        child_offsets = torch.arange(compression_rate, device=device)
-        children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
-        children = children[children < N]
-        
-        # 过滤：只保留左边界 ≤ m 的节点
-        valid_mask = node_ranges[:, 0] <= query_pos
-        valid_children = children[valid_mask[children]]
-        
-        candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        candidates_mask[valid_children] = True
-    
-    # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
-    rightmost_idx = query_pos // (compression_rate ** layer_idx)
-    if rightmost_idx < N:
-        candidates_mask[rightmost_idx] = True
-    
-    # 提取候选节点
-    candidate_indices = torch.where(candidates_mask)[0]  # [num_cand]
-    candidate_indices = torch.sort(candidate_indices)[0]  # 确保有序
-    num_candidates = candidate_indices.numel()
-    
-    if num_candidates == 0:
-        raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
-    
-    candidate_k = layer_k[:, candidates_mask]  # [1, num_cand, 1, D]
-    candidate_v = layer_v[:, candidates_mask]  # [1, num_cand, 1, D]
-    
-    # 应用 RoPE - 需要先初始化缓存
-    positions = torch.arange(num_candidates, device=device)
-    cos, sin = rotary.forward(positions, device)
-    candidate_k_rope = apply_rotary_emb(candidate_k, cos[None, :, None, :], sin[None, :, None, :])
-    
-    # Query 使用最后一个位置（与最右侧候选节点相同）
-    cos_q = cos[num_candidates - 1]
-    sin_q = sin[num_candidates - 1]
-    query_rope = apply_rotary_emb(query, cos_q, sin_q)
-    
-    # 计算注意力分数 (single head, no pooling)
-    scores = torch.einsum('bhd,bnhd->bhn', query_rope * scale, candidate_k_rope)  # [1, 1, num_cand]
-    scores_pooled = scores.squeeze(0).squeeze(0)  # [num_cand]
-    
-    # Merge ALL candidates into softmax state (Kernel 2.1 behavior)
-    merge_scores = scores_pooled.unsqueeze(0)  # [1, num_cand]
-    merge_values = candidate_v  # [1, num_cand, 1, D]
-    
-    max_score, sum_exp, weighted_output = online_softmax_merge(
-        max_score, sum_exp, weighted_output, merge_scores, merge_values
-    )
-    
-    # Select Top-K for next layer (but don't subtract them yet)
-    is_bottom_layer = (layer_idx == 0)
-    if is_bottom_layer:
-        selected_indices = None
-        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
-        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
-    else:
-        # 使用 importance 选择 Top-K（与 compute_select_and_merge 一致）
-        # 计算当前最大分数（merge 后的 max_score）
-        cur_max = max_score.item()
-        
-        # 计算 importance：最右侧节点 = 1.0，其他节点 = exp(score - cur_max)
-        is_rightmost = (candidate_indices == rightmost_idx)
-        importance = torch.where(
-            is_rightmost,
-            torch.tensor(1.0, device=device, dtype=scores_pooled.dtype),
-            torch.exp(scores_pooled - cur_max)
-        )
-        
-        # 基于 importance 选择 Top-K
-        actual_top_k = min(top_k, num_candidates)
-        topk_importance, topk_local_idx = torch.topk(importance, actual_top_k, dim=0)  # [actual_top_k]
-        
-        # 选中的节点索引
-        selected_indices = candidate_indices[topk_local_idx].unsqueeze(0)  # [1, actual_top_k]
-        
-        # 返回未排序的 Top-K 信息（按 importance 顺序，padded with -1）
-        # 注意：这里返回的是原始 score，不是 importance
-        topk_indices_unsorted = torch.full([top_k], -1, dtype=torch.int32, device=device)
-        topk_scores_unsorted = torch.zeros([top_k], dtype=torch.float32, device=device)
-        
-        topk_indices_unsorted[:actual_top_k] = candidate_indices[topk_local_idx].to(torch.int32)
-        topk_scores_unsorted[:actual_top_k] = scores_pooled[topk_local_idx]
-    
-    return max_score, sum_exp, weighted_output, selected_indices, topk_indices_unsorted, topk_scores_unsorted
 
 
 def forward_kernel(
@@ -494,12 +533,12 @@ def forward_kernel(
     scale: Optional[float] = None
 ) -> torch.Tensor:
     """
-    forward kernel with online softmax algorithm
+    forward kernel with online softmax algorithm (Supports Group Query Attention)
 
     Args:
         q: [B, T, H, D]
-        k: [B, T, H, D]
-        v: [B, T, H, D]
+        k: [B, T, H_kv, D]
+        v: [B, T, H_kv, D]
         query_positions: [B, num_positions] or None
             If None, compute attention for all positions.
             If provided, only compute attention for specified positions per batch.
@@ -513,6 +552,11 @@ def forward_kernel(
     """
     nvtx.range_push("Naive_Forward")
     B, T, H, D = q.shape
+    H_kv = k.shape[2]
+    
+    assert H % H_kv == 0, f"Query heads {H} must be divisible by KV heads {H_kv}"
+    group_size = H // H_kv
+    
     device = q.device
     if scale is None:
         scale = D ** -0.5
@@ -540,6 +584,9 @@ def forward_kernel(
             positions_to_compute = [p for p in batch_positions if p >= 0]
         
         for h in range(H):
+            # Determine which KV head to use
+            kv_h = h // group_size
+            
             for t in positions_to_compute:
                 current_query = q[b:b+1, t, h:h+1]  # [1, 1, D]
                 
@@ -554,9 +601,13 @@ def forward_kernel(
                 for layer_idx in range(num_layers - 1, -1, -1):
                     layer_k, layer_v, node_ranges = layers[layer_idx]
                     
+                    # Select the specific KV head
+                    layer_k_head = layer_k[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
+                    layer_v_head = layer_v[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
+                    
                     max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
-                        layer_k[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
-                        layer_v[b:b+1, :, h:h+1],  # [1, N, 1, D] - single head
+                        layer_k_head,
+                        layer_v_head,
                         node_ranges,
                         current_query,
                         t,

@@ -1,15 +1,16 @@
-"""
-测试全部位置的 naive_stable_topk 和 parallel2_stable_topk 实现对比
-(支持 Group Query Attention)
+"""全位置正确性对比（MHA）。
 
-两个实现都使用 Bit-Packing Top-K 技术，确保结果一致
+- Triton: src/parallel_mha.py (htree_forward_v2)
+- Naive : src/naive_mha.py (forward_kernel)
+
+两边都使用 stable Top-K（Bit-Packing）以提高确定性与对齐度。
 """
 
 import sys
 import argparse
 import torch
-from src.parallel import htree_forward_v2
-from src.naive_stable_topk import forward_kernel as naive_forward
+from src.parallel_mha import htree_forward_v2
+from src.naive_mha import forward_kernel as naive_forward
 
 def _warmup_triton(
     q: torch.Tensor,
@@ -74,7 +75,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     scale = K ** -0.5
     
     print("\n" + "="*80)
-    print(f"全位置对比测试配置 (GQA): B={B}, T={T}, H={H}, H_kv={H_kv}, K={K}, V={V}")
+    print(f"全位置对比测试配置 (MHA): B={B}, T={T}, H={H}, H_kv={H_kv}, K={K}, V={V}")
     print(f"compression_rate={compression_rate}, top_k_per_layer={top_k_per_layer}")
     print(f"scale={scale}")
     print(f"compare_naive={compare_naive}")
@@ -84,10 +85,10 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     test_positions = list(range(T))
     query_positions = torch.tensor([test_positions], device=device).expand(B, -1)
     
-    # Naive Stable TopK 实现 (Bit-Packing 优化版)
+    # Naive 参考实现（MHA）
     output_naive = None
     if compare_naive:
-        print("运行 naive_stable_topk 实现 (Bit-Packing 优化版)...")
+        print("运行 naive_mha 参考实现 (stable top-k / bit-packing)...")
         try:
             output_naive = naive_forward(
                 q, k, v,
@@ -97,12 +98,12 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
                 top_k_per_layer=top_k_per_layer,
                 scale=scale
             )
-            print(f"✓ Naive Stable TopK forward 完成: output shape {output_naive.shape}\n")
+            print(f"✓ naive_mha forward 完成: output shape {output_naive.shape}\n")
         except Exception as e:
             print(f"✗ Naive Stable TopK forward 失败: {e}")
             raise
     else:
-        print("跳过 naive_stable_topk 实现的运行 (--compare-naive=False)\n")
+        print("跳过 naive_mha 的运行 (--compare-naive=False)\n")
 
     # Triton warmup
     _warmup_triton(
@@ -115,8 +116,8 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
         device=device,
     )
     
-    # Parallel2 Stable TopK 实现 (Bit-Packing 优化版)
-    print("运行 Parallel2 Stable TopK 实现 (Bit-Packing 优化版)...")
+    # Triton 实现（MHA）
+    print("运行 Triton htree (src/parallel_mha.py) ...")
     try:
         _cuda_sync_if_needed(device)
         output_triton = htree_forward_v2(
@@ -127,7 +128,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
             scale=scale,
         )
         _cuda_sync_if_needed(device)
-        print(f"✓ Parallel2 Stable TopK forward 完成: output shape {output_triton.shape}\n")
+        print(f"✓ Triton htree forward 完成: output shape {output_triton.shape}\n")
     except Exception as e:
         print(f"✗ Parallel2 Stable TopK forward 失败: {e}")
         raise
@@ -251,7 +252,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
         return len(failed_positions) == 0
     else:
         # 不进行对比，仅运行 triton 版本
-        print(f"\n✓ Parallel2 Stable TopK forward 已完成")
+        print(f"\n✓ Triton htree forward 已完成")
         print("="*80)
         return True
 

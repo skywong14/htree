@@ -1,0 +1,343 @@
+"""全位置正确性对比（GQA）。
+
+- Triton: src/parallel.py (htree_forward_v2)
+- Naive : src/naive_gqa.py (forward_kernel)
+
+两边都使用 stable Top-K（Bit-Packing）以提高确定性与对齐度。
+"""
+
+import sys
+import argparse
+import torch
+from src.parallel import htree_forward_v2
+from src.naive_gqa import forward_kernel as naive_forward
+
+
+def _format_1d_tensor_fixed(x: torch.Tensor, *, decimals: int = 8) -> str:
+    """Format a 1D tensor with fixed decimals (e.g. 8 digits after the dot)."""
+    vals = x.detach().to(torch.float32).cpu().flatten().tolist()
+    return "[" + ", ".join(f"{v:.{decimals}f}" for v in vals) + "]"
+
+def _warmup_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    compression_rate: int,
+    max_top_nodes: int,
+    top_k_per_layer: int,
+    scale: float,
+    warmup_iters: int,
+    device: torch.device,
+) -> None:
+    if warmup_iters <= 0:
+        return
+    if device.type != "cuda":
+        # Triton only runs on CUDA; keep behavior explicit.
+        return
+
+    print(f"\n[Warmup] 预热 Triton kernel: {warmup_iters} 次 ...")
+    with torch.no_grad():
+        for i in range(warmup_iters):
+            _ = htree_forward_v2(
+                q, k, v,
+                compression_rate=compression_rate,
+                max_top_nodes=max_top_nodes,
+                top_k_per_layer=top_k_per_layer,
+                scale=scale,
+            )
+            _cuda_sync_if_needed(device)
+            print(f"[Warmup] 完成 {i + 1}/{warmup_iters}")
+    print("[Warmup] Triton 预热完成。\n")
+
+
+def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = True, gpu: int = 0):
+    """测试所有位置的输出结果"""
+    # 设置随机种子保证可重现
+    torch.manual_seed(42)
+
+    if torch.cuda.is_available():
+        if gpu < 0:
+            raise ValueError(f"--gpu must be >= 0, got {gpu}")
+        if torch.cuda.device_count() <= gpu:
+            raise ValueError(f"Requested --gpu {gpu}, but only {torch.cuda.device_count()} CUDA device(s) are visible")
+        torch.cuda.set_device(gpu)
+        device = torch.device(f"cuda:{gpu}")
+    else:
+        device = torch.device("cpu")
+    
+    # 测试配置
+    # GQA Configuration: H (Query Heads), H_kv (KV Heads)
+    B, T, H, H_kv, K, V = 1, 20000, 16, 4, 4, 4
+    B, T, H, H_kv, K, V = 1, 20000, 4, 1, 4, 4
+    
+    # 使用 float32，确保 naive 与 triton 输入精度一致
+    q = torch.randn(B, T, H, K, device=device, dtype=torch.float32).contiguous()
+    k = torch.randn(B, T, H_kv, K, device=device, dtype=torch.float32).contiguous()
+    v = torch.randn(B, T, H_kv, V, device=device, dtype=torch.float32).contiguous()
+
+    compression_rate = 16
+    max_top_nodes = 8192
+    top_k_per_layer = 512
+    scale = K ** -0.5
+    
+    print("\n" + "="*80)
+    print(f"全位置对比测试配置 (GQA): B={B}, T={T}, H={H}, H_kv={H_kv}, K={K}, V={V}")
+    print(f"compression_rate={compression_rate}, top_k_per_layer={top_k_per_layer}")
+    print(f"scale={scale}")
+    print(f"compare_naive={compare_naive}")
+    print("="*80 + "\n")
+
+    # Pass/fail thresholds (absolute error)
+    # User requested: max <= 0.001, mean <= 0.0005
+    ABS_THRESH_MAX = 0.001
+    ABS_THRESH_MEAN = 0.0005
+    
+    # 测试所有位置
+    test_positions = list(range(T))
+    query_positions = torch.tensor([test_positions], device=device).expand(B, -1)
+    
+    # Naive 参考实现（GQA）
+    output_naive = None
+    if compare_naive:
+        print("运行 naive_gqa 参考实现 (stable top-k / bit-packing)...")
+        try:
+            output_naive = naive_forward(
+                q, k, v,
+                query_positions=query_positions,
+                compression_rate=compression_rate,
+                max_top_nodes=max_top_nodes,
+                top_k_per_layer=top_k_per_layer,
+                scale=scale
+            )
+            print(f"✓ naive_gqa forward 完成: output shape {output_naive.shape}\n")
+        except Exception as e:
+            print(f"✗ Naive Stable TopK forward 失败: {e}")
+            raise
+    else:
+        print("跳过 naive_gqa 的运行 (--compare-naive=False)\n")
+
+    # Triton warmup
+    _warmup_triton(
+        q, k, v,
+        compression_rate=compression_rate,
+        max_top_nodes=max_top_nodes,
+        top_k_per_layer=top_k_per_layer,
+        scale=scale,
+        warmup_iters=warmup_triton_iters,
+        device=device,
+    )
+    
+    # Triton 实现（GQA）
+    print("运行 Triton htree (src/parallel.py) ...")
+    try:
+        _cuda_sync_if_needed(device)
+        output_triton = htree_forward_v2(
+            q, k, v,
+            compression_rate=compression_rate,
+            max_top_nodes=max_top_nodes,
+            top_k_per_layer=top_k_per_layer,
+            scale=scale,
+        )
+        _cuda_sync_if_needed(device)
+        print(f"✓ Triton htree forward 完成: output shape {output_triton.shape}\n")
+    except Exception as e:
+        print(f"✗ Parallel2 Stable TopK forward 失败: {e}")
+        raise
+    
+    # 误差分析
+    if compare_naive and output_naive is not None:
+        print("="*80)
+        print("开始逐位置误差分析...")
+        print("="*80 + "\n")
+        
+        # 统计信息
+        all_max_abs_diffs = []
+        all_mean_abs_diffs = []
+        all_max_rel_diffs = []
+        all_mean_rel_diffs = []
+        failed_positions = []
+        
+        # 用于显示进度
+        report_interval = 1000
+        
+        for i, pos in enumerate(test_positions):
+            # 比较结果
+            naive_out = output_naive[:, pos, :, :].float()
+            triton_out = output_triton[:, pos, :, :].float()
+            
+            # 计算误差
+            abs_diff = torch.abs(naive_out - triton_out)
+            max_abs_diff = abs_diff.max().item()
+            mean_abs_diff = abs_diff.mean().item()
+            
+            rel_diff = abs_diff / (torch.abs(naive_out) + 1e-6)
+            max_rel_diff = rel_diff.max().item()
+            mean_rel_diff = rel_diff.mean().item()
+
+            # Per-head relative error stats (for better debugging)
+            # rel_diff: [1, H, V] -> [H, V]
+            rel_by_head = rel_diff[0]
+            max_rel_by_head = rel_by_head.max(dim=1).values  # [H]
+            mean_rel_by_head = rel_by_head.mean(dim=1)       # [H]
+            
+            # 记录统计
+            all_max_abs_diffs.append(max_abs_diff)
+            all_mean_abs_diffs.append(mean_abs_diff)
+            all_max_rel_diffs.append(max_rel_diff)
+            all_mean_rel_diffs.append(mean_rel_diff)
+            
+            # 检查是否通过：使用绝对误差阈值
+            pass_max = max_abs_diff < ABS_THRESH_MAX
+            pass_mean = mean_abs_diff < ABS_THRESH_MEAN
+
+            if not (pass_max and pass_mean):
+                # Pick one head to report: prefer a head that violates absolute thresholds; otherwise the worst head.
+                abs_by_head = abs_diff[0]  # [H, V]
+                max_abs_by_head = abs_by_head.max(dim=1).values
+                mean_abs_by_head = abs_by_head.mean(dim=1)
+
+                violating = (max_abs_by_head >= ABS_THRESH_MAX) | (mean_abs_by_head >= ABS_THRESH_MEAN)
+                if violating.any():
+                    bad_head = int(torch.where(violating)[0][0].item())
+                else:
+                    bad_head = int(max_abs_by_head.argmax().item())
+
+                failed_positions.append({
+                    'pos': pos,
+                    'max_abs': max_abs_diff,
+                    'mean_abs': mean_abs_diff,
+                    'max_rel': max_rel_diff,
+                    'mean_rel': mean_rel_diff,
+                    'bad_head': bad_head,
+                    'bad_head_max_abs': float(max_abs_by_head[bad_head].item()),
+                    'bad_head_mean_abs': float(mean_abs_by_head[bad_head].item()),
+                    'bad_head_max_rel': float(max_rel_by_head[bad_head].item()),
+                    'bad_head_mean_rel': float(mean_rel_by_head[bad_head].item()),
+                    'naive': naive_out[0, bad_head, :].cpu(),
+                    'triton': triton_out[0, bad_head, :].cpu(),
+                })
+            
+            # 定期报告进度
+            if (i + 1) % report_interval == 0 or i == 0 or i == len(test_positions) - 1:
+                status = "✓" if (pass_max and pass_mean) else "✗"
+                print(
+                    f"{status} 位置 {pos:5d}: "
+                    f"abs=[max={max_abs_diff:.6f}, mean={mean_abs_diff:.6f}] "
+                    f"(thr: max<{ABS_THRESH_MAX}, mean<{ABS_THRESH_MEAN}), "
+                    f"rel=[max={max_rel_diff * 100:.4f}%, mean={mean_rel_diff * 100:.4f}%]"
+                )
+        
+        # 汇总统计
+        print("\n" + "="*80)
+        print("统计汇总:")
+        print("="*80)
+        
+        max_abs_array = torch.tensor(all_max_abs_diffs)
+        mean_abs_array = torch.tensor(all_mean_abs_diffs)
+        max_rel_array = torch.tensor(all_max_rel_diffs)
+        mean_rel_array = torch.tensor(all_mean_rel_diffs)
+        
+        print(f"\n绝对误差 (max):")
+        print(f"  最小值: {max_abs_array.min().item():.8f}")
+        print(f"  最大值: {max_abs_array.max().item():.8f}")
+        print(f"  平均值: {max_abs_array.mean().item():.8f}")
+        print(f"  中位数: {max_abs_array.median().item():.8f}")
+        print(f"  标准差: {max_abs_array.std().item():.8f}")
+        
+        print(f"\n绝对误差 (mean):")
+        print(f"  最小值: {mean_abs_array.min().item():.8f}")
+        print(f"  最大值: {mean_abs_array.max().item():.8f}")
+        print(f"  平均值: {mean_abs_array.mean().item():.8f}")
+        print(f"  中位数: {mean_abs_array.median().item():.8f}")
+        print(f"  标准差: {mean_abs_array.std().item():.8f}")
+        
+        print(f"\n相对误差 (max):")
+        print(f"  最小值: {max_rel_array.min().item():.8f}")
+        print(f"  最大值: {max_rel_array.max().item():.8f}")
+        print(f"  平均值: {max_rel_array.mean().item():.8f}")
+        print(f"  中位数: {max_rel_array.median().item():.8f}")
+        print(f"  标准差: {max_rel_array.std().item():.8f}")
+        
+        print(f"\n相对误差 (mean):")
+        print(f"  最小值: {mean_rel_array.min().item():.8f}")
+        print(f"  最大值: {mean_rel_array.max().item():.8f}")
+        print(f"  平均值: {mean_rel_array.mean().item():.8f}")
+        print(f"  中位数: {mean_rel_array.median().item():.8f}")
+        print(f"  标准差: {mean_rel_array.std().item():.8f}")
+        
+        # 报告失败位置
+        if failed_positions:
+            print(f"\n" + "="*80)
+            print(f"失败位置数量: {len(failed_positions)}/{T}")
+            print("="*80)
+            
+            # 显示前10个失败位置的详细信息
+            print(f"\n显示前{min(10, len(failed_positions))}个失败位置的详细信息:\n")
+            for i, fail_info in enumerate(failed_positions[:10]):
+                print(f"位置 {fail_info['pos']}:")
+                print(f"  max_abs={fail_info['max_abs']:.6f}, mean_abs={fail_info['mean_abs']:.6f}")
+                print(f"  max_rel={fail_info['max_rel']:.6f}, mean_rel={fail_info['mean_rel']:.6f}")
+                print(
+                    f"  bad_head={fail_info['bad_head']} "
+                    f"(head_abs: max={fail_info['bad_head_max_abs']:.6f}, mean={fail_info['bad_head_mean_abs']:.6f}; "
+                    f"head_rel: max={fail_info['bad_head_max_rel'] * 100:.4f}%, mean={fail_info['bad_head_mean_rel'] * 100:.4f}%)"
+                )
+                print(
+                    f"  Naive_StableTopK[head={fail_info['bad_head']}]:     "
+                    f"{_format_1d_tensor_fixed(fail_info['naive'], decimals=8)}"
+                )
+                print(
+                    f"  Parallel2_StableTopK[head={fail_info['bad_head']}]: "
+                    f"{_format_1d_tensor_fixed(fail_info['triton'], decimals=8)}"
+                )
+                print()
+        else:
+            print(f"\n✓ 所有{T}个位置测试通过!")
+        
+        print("="*80)
+        
+        return len(failed_positions) == 0
+    else:
+        # 不进行对比，仅运行 triton 版本
+        print(f"\n✓ Triton htree forward 已完成")
+        print("="*80)
+        return True
+
+def _cuda_sync_if_needed(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+if __name__ == "__main__":
+    try:
+        parser = argparse.ArgumentParser(description="All-positions correctness test for stable top-k (naive vs triton).")
+        parser.add_argument(
+            "--gpu",
+            type=int,
+            default=0,
+            help="CUDA device index to use (after CUDA_VISIBLE_DEVICES remapping). Ignored if CUDA is unavailable.",
+        )
+        parser.add_argument(
+            "--warmup-triton-iters",
+            type=int,
+            default=2,
+            help="Warm up triton kernels by running htree_forward_v2 N times before the real run (default: 2).",
+        )
+        parser.add_argument(
+            "--no-compare",
+            action="store_true",
+            help="Disable running/comparing the naive implementation.",
+        )
+        args = parser.parse_args()
+
+        success = test_all_positions(
+            warmup_triton_iters=args.warmup_triton_iters,
+            compare_naive=(not args.no_compare),
+            gpu=args.gpu,
+        )
+        sys.exit(0 if success else 1)
+    except Exception as e:
+        print(f"\n测试执行失败: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

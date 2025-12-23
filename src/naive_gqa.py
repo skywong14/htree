@@ -7,6 +7,9 @@ import torch
 import torch.cuda.nvtx as nvtx
 import torch.nn.functional as F
 
+HTREE_SCORE_NEG_INF: float = -1.0e10
+HTREE_SCORE_VALID_THRESHOLD: float = HTREE_SCORE_NEG_INF * 0.9
+
 
 class Rotary(torch.nn.Module):
     """
@@ -226,6 +229,52 @@ def stable_topk_with_bitpacking(
     return topk_buffer_positions, selected_node_indices_sorted
 
 
+def stable_topk_positions_with_bitpacking(
+    scores: torch.Tensor,
+    k: int,
+    force_select_pos: Optional[int] = None,
+    log_n: int = 13,
+) -> torch.Tensor:
+    """Return Top-K buffer positions using the same bit-packing stable sort.
+
+    Args:
+        scores: [N] float/half tensor (will be promoted to float32 internally)
+        k: number of positions to return
+        force_select_pos: optional position in [0, N) forced to have score 1e3
+        log_n: number of bits used for encoding indices (13 for N<=8192)
+
+    Returns:
+        topk_buffer_positions: [k] int32, padded with -1 if N < k
+    """
+    scores_fp32 = scores.float()
+    n = scores_fp32.numel()
+    device = scores_fp32.device
+    if n == 0:
+        return torch.full([k], -1, dtype=torch.int32, device=device)
+
+    if force_select_pos is not None and 0 <= force_select_pos < n:
+        scores_fp32 = scores_fp32.clone()
+        scores_fp32[force_select_pos] = 1e3
+
+    actual_k = min(k, n)
+    buffer_indices = torch.arange(n, device=device, dtype=torch.int32)
+    encoded_scores = bitpack_encode(scores_fp32, buffer_indices, log_n)
+    sorted_encoded_scores, _ = torch.sort(encoded_scores, descending=True)
+    buffer_positions, clean_scores = bitpack_decode(sorted_encoded_scores, log_n)
+
+    # Mirror Triton filtering semantics: keep only scores above "masked" threshold.
+    # Note: scores here are "importance" (>=0 typically). Masked items should be -inf,
+    # but we still filter for safety.
+    valid = clean_scores > HTREE_SCORE_VALID_THRESHOLD
+    buffer_positions = torch.where(valid, buffer_positions, torch.full_like(buffer_positions, -1))
+
+    topk_buffer_positions = buffer_positions[:actual_k]
+    if actual_k < k:
+        padding = torch.full([k - actual_k], -1, dtype=torch.int32, device=device)
+        topk_buffer_positions = torch.cat([topk_buffer_positions, padding])
+    return topk_buffer_positions
+
+
 def build_tree(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -413,16 +462,20 @@ def compute_select_and_merge(
     else:
         # 非顶层：只考虑上一层选中节点的子节点
         parents = prev_selected_parent_indices.reshape(-1)  # [M]
-        child_offsets = torch.arange(compression_rate, device=device)
-        children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
-        children = children[children < N]
-        
-        # 过滤：只保留左边界 ≤ m 的节点
-        valid_mask = node_ranges[:, 0] <= query_pos
-        valid_children = children[valid_mask[children]]
-        
-        candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
-        candidates_mask[valid_children] = True
+        parents = parents[parents >= 0]
+        if parents.numel() == 0:
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            child_offsets = torch.arange(compression_rate, device=device)
+            children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
+            children = children[children < N]
+
+            # 过滤：只保留左边界 ≤ m 的节点
+            valid_mask = node_ranges[:, 0] <= query_pos
+            valid_children = children[valid_mask[children]]
+
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            candidates_mask[valid_children] = True
     
     # 最右侧节点（包含 query 位置 m 的节点）一定在候选集中
     rightmost_idx = query_pos // (compression_rate ** layer_idx)
@@ -518,6 +571,160 @@ def compute_select_and_merge(
         return max_score, sum_exp, weighted_output, selected_indices
 
 
+def compute_select_and_merge_shared_gqa(
+    layer_k: torch.Tensor,
+    layer_v: torch.Tensor,
+    node_ranges: torch.Tensor,
+    query_group: torch.Tensor,
+    query_pos: int,
+    prev_selected_parent_indices: Optional[torch.Tensor],
+    compression_rate: int,
+    layer_idx: int,
+    rotary: Rotary,
+    max_score: torch.Tensor,
+    sum_exp: torch.Tensor,
+    weighted_output: torch.Tensor,
+    top_k: int = 512,
+    scale: Optional[float] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """GQA shared-TopK variant (NSA-style) for naive reference.
+
+    For a KV head at (b,t), we compute scores for all query heads in the group,
+    then compute per-candidate importance:
+      importance_i = sum_g exp(score_{g,i} - logsumexp(score_{g,:}))
+    and select a shared Top-K set of candidates for the whole group.
+
+    Non-selected candidates are merged into each head's online-softmax state.
+    Selected indices (ascending) are shared and passed to the next layer.
+
+    Shapes:
+      layer_k/layer_v: [1, N, 1, D] (already sliced to this KV head)
+      query_group: [G, D]
+      max_score/sum_exp: [G]
+      weighted_output: [G, D]
+    """
+    B, N, H, D = layer_k.shape
+    device = layer_k.device
+    assert B == 1 and H == 1, "This function expects a single KV head slice"
+    assert query_group.dim() == 2 and query_group.shape[1] == D
+    G = query_group.shape[0]
+
+    if scale is None:
+        scale = D ** -0.5
+
+    # Determine candidates (shared across the query group)
+    if prev_selected_parent_indices is None:
+        candidates_mask = node_ranges[:, 0] <= query_pos
+    else:
+        parents = prev_selected_parent_indices.reshape(-1)
+        parents = parents[parents >= 0]
+        if parents.numel() == 0:
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            child_offsets = torch.arange(compression_rate, device=device)
+            children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
+            children = children[children < N]
+
+            valid_mask = node_ranges[:, 0] <= query_pos
+            valid_children = children[valid_mask[children]]
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            candidates_mask[valid_children] = True
+
+    rightmost_idx = query_pos // (compression_rate ** layer_idx)
+    if rightmost_idx < N:
+        candidates_mask[rightmost_idx] = True
+
+    candidate_indices = torch.where(candidates_mask)[0]
+    candidate_indices = torch.sort(candidate_indices)[0]
+    num_candidates = candidate_indices.numel()
+    if num_candidates == 0:
+        raise RuntimeError(f"No candidates available at layer {layer_idx}, query_pos {query_pos}")
+
+    # Gather KV head tensors
+    candidate_k = layer_k[:, candidates_mask].squeeze(0).squeeze(1)  # [num_cand, D]
+    candidate_v = layer_v[:, candidates_mask].squeeze(0).squeeze(1)  # [num_cand, D]
+
+    # RoPE: positions are local within the candidate list
+    positions = torch.arange(num_candidates, device=device)
+    cos, sin = rotary.forward(positions, device)
+    candidate_k_rope = apply_rotary_emb(candidate_k, cos, sin)  # [num_cand, D]
+
+    cos_q = cos[num_candidates - 1]  # [D/2]
+    sin_q = sin[num_candidates - 1]
+    query_rope = apply_rotary_emb(query_group, cos_q, sin_q)  # [G, D]
+
+    scores = (query_rope * scale) @ candidate_k_rope.transpose(0, 1)  # [G, num_cand]
+
+    is_bottom_layer = (layer_idx == 0)
+    if is_bottom_layer:
+        selected_indices = None
+        selected_mask = None
+    else:
+        # Compute shared importance across the query group
+        lse = torch.logsumexp(scores, dim=1)  # [G]
+        p = torch.exp(scores - lse[:, None]).to(torch.float32)  # [G, num_cand]
+        # Triton CUDA kernels often run with FTZ (flush-to-zero) for subnormals.
+        # To better match that behavior (and thus stable Top-K tie-breaking),
+        # explicitly flush subnormal probabilities to 0.
+        p = torch.where(p < torch.finfo(torch.float32).tiny, torch.zeros_like(p), p)
+        imp = p.sum(dim=0)  # [num_cand]
+
+        # Force the rightmost candidate selected (match Triton logic)
+        force_pos = num_candidates - 1
+        if rightmost_idx < N:
+            # sanity: if due to any corner case rightmost isn't last, locate it
+            loc = torch.where(candidate_indices == rightmost_idx)[0]
+            if loc.numel() > 0:
+                force_pos = int(loc[-1].item())
+
+        topk_buffer_positions = stable_topk_positions_with_bitpacking(
+            imp,
+            top_k,
+            force_select_pos=force_pos,
+            log_n=13,
+        )
+        valid_pos = topk_buffer_positions[topk_buffer_positions >= 0].long()
+        selected_mask = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+        if valid_pos.numel() > 0:
+            selected_mask[valid_pos] = True
+
+        selected_node_indices = candidate_indices[valid_pos]
+        selected_node_indices_sorted, _ = torch.sort(selected_node_indices)
+        selected_indices = torch.full([top_k], -1, dtype=torch.int32, device=device)
+        take = min(top_k, selected_node_indices_sorted.numel())
+        if take > 0:
+            selected_indices[:take] = selected_node_indices_sorted[:take].to(torch.int32)
+        selected_indices = selected_indices.unsqueeze(0)  # [1, top_k]
+
+    # Merge non-topk candidates into each head's online-softmax state
+    if selected_mask is None:
+        merge_mask = torch.ones(num_candidates, dtype=torch.bool, device=device)
+    else:
+        merge_mask = ~selected_mask
+
+    merge_values = candidate_v[merge_mask]  # [num_merge, D]
+    for g in range(G):
+        merge_scores = scores[g, merge_mask]  # [num_merge]
+
+        # online_softmax_merge expects shapes [1], [1], [1,1,D], [1,num], [1,num,1,D]
+        ms = max_score[g:g+1]
+        ss = sum_exp[g:g+1]
+        wo = weighted_output[g:g+1].unsqueeze(0)  # [1,1,D]
+
+        ms, ss, wo = online_softmax_merge(
+            ms,
+            ss,
+            wo,
+            merge_scores.unsqueeze(0),
+            merge_values.unsqueeze(0).unsqueeze(2),
+        )
+        max_score[g] = ms[0]
+        sum_exp[g] = ss[0]
+        weighted_output[g] = wo.squeeze(0).squeeze(0)
+
+    return max_score, sum_exp, weighted_output, selected_indices
+
+
 def forward_kernel(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -570,7 +777,6 @@ def forward_kernel(
     output = torch.zeros_like(q)
     
     for b in range(B):
-        # Determine positions to compute for this batch element
         if query_positions is None:
             positions_to_compute = range(0, T)
         else:
@@ -578,50 +784,47 @@ def forward_kernel(
             if isinstance(batch_positions, int):
                 batch_positions = [batch_positions]
             positions_to_compute = [p for p in batch_positions if p >= 0]
-        
-        for h in range(H):
-            # Determine which KV head to use
-            kv_h = h // group_size
-            
+
+        # Process per KV head; heads in the same GQA group share the same Top-K selection.
+        for kv_h in range(H_kv):
+            h_start = kv_h * group_size
+            h_end = (kv_h + 1) * group_size
+            head_ids = list(range(h_start, h_end))
+
             for t in positions_to_compute:
-                current_query = q[b:b+1, t, h:h+1]  # [1, 1, D]
-                
-                # Initialize online softmax state (per head)
-                max_score = torch.tensor([-float('inf')], device=q.device)
-                sum_exp = torch.tensor([0.0], device=q.device)
-                weighted_output = torch.zeros(1, 1, D, device=q.device, dtype=q.dtype)
-                
-                # 3. Iterate from top to bottom layer with online softmax merging
-                prev_selected_indices = None
-                
+                query_group = q[b, t, head_ids]  # [G, D]
+
+                max_score_g = torch.full([group_size], -float('inf'), device=q.device, dtype=torch.float32)
+                sum_exp_g = torch.zeros([group_size], device=q.device, dtype=torch.float32)
+                # Accumulate in fp32 to avoid repeated fp16/bf16 truncation across many merges.
+                weighted_out_g = torch.zeros([group_size, D], device=q.device, dtype=torch.float32)
+
+                prev_selected_indices = None  # shared across the group
+
                 for layer_idx in range(num_layers - 1, -1, -1):
                     layer_k, layer_v, node_ranges = layers[layer_idx]
-                    
-                    # Select the specific KV head
-                    layer_k_head = layer_k[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
-                    layer_v_head = layer_v[b:b+1, :, kv_h:kv_h+1] # [1, N, 1, D]
-                    
-                    max_score, sum_exp, weighted_output, selected_indices = compute_select_and_merge(
+                    layer_k_head = layer_k[b:b+1, :, kv_h:kv_h+1]
+                    layer_v_head = layer_v[b:b+1, :, kv_h:kv_h+1]
+
+                    max_score_g, sum_exp_g, weighted_out_g, prev_selected_indices = compute_select_and_merge_shared_gqa(
                         layer_k_head,
                         layer_v_head,
                         node_ranges,
-                        current_query,
+                        query_group,
                         t,
                         prev_selected_indices,
                         compression_rate,
                         layer_idx,
                         rotary,
-                        max_score,
-                        sum_exp,
-                        weighted_output,
-                        top_k_per_layer,
-                        scale
+                        max_score_g,
+                        sum_exp_g,
+                        weighted_out_g,
+                        top_k=top_k_per_layer,
+                        scale=scale,
                     )
-                    
-                    prev_selected_indices = selected_indices
-                
-                # 4. Normalize to get final output
-                output[b:b+1, t, h:h+1] = (weighted_output / sum_exp.unsqueeze(-1)).squeeze(0)
+
+                out_group = weighted_out_g / sum_exp_g.clamp_min(1e-30)[:, None]
+                output[b, t, head_ids] = out_group.to(output.dtype)
     nvtx.range_pop()  # Phase2_Attention
 
     nvtx.range_pop()  # Naive_Forward
