@@ -5,43 +5,43 @@ htree Triton Kernel
 Pipeline
   Phase 1: Tree Building
     - Kernel 1: `htree_build_kernel_v2`
-      · 对 (K,V) 逐层 mean pooling，构建从底层到顶层的 (layers_k, layers_v)
+      · 对 (K,V) 逐层 mean pooling, 构建从底层到顶层的 (layers_k, layers_v)
 
   Phase 1.5: RoPE Cache
-    - 在 host 侧预计算 `cos_cache/sin_cache`（供所有层复用）
+    - 在 host 侧预计算 `cos_cache/sin_cache` (供所有层复用)
 
   Phase 2: Init Global State & Workspaces
-    - 初始化全局 online-softmax 状态：`global_max/global_sum/global_output`
-    - 分配每层复用的 workspace：
-      · `all_scores`: [B, T, H, MAX_CANDIDATES(=8192)] —— 候选 buffer（仅存 score）
+    - 初始化全局 online-softmax 状态: `global_max/global_sum/global_output`
+    - 分配每层复用的 workspace: 
+      · `all_scores`: [B, T, H, MAX_CANDIDATES(=8192)] —— 候选 buffer (仅存 score)
       · `num_candidates`: [B, T, H_kv] —— KV head 粒度共享的候选数量 n_cand
-      · `prev_selected_parents`: [B, T, H_kv, TOP_K] —— 下一层展开所需的 parent 列表（升序）
+      · `prev_selected_parents`: [B, T, H_kv, TOP_K] —— 下一层展开所需的 parent 列表 (升序)
 
-  Phase 3: Layer-by-layer Forward（top → bottom）
-    - Kernel 2.1a `htree_compute_scores_kernel`（scores only）
-      · 对每个 (b,t,h) 计算其候选集合的 score，写入 `all_scores[b,t,h,0:n_cand]`
-      · 候选集合由 `prev_selected_parents[b,t,h_kv,:]` 给出（KV head 粒度共享）
-      · 采用固定 tile：每批 32 parents × COMPRESSION_RATE(通常 16) children = 512
+  Phase 3: Layer-by-layer Forward (top → bottom)
+    - Kernel 2.1a `htree_compute_scores_kernel` (scores only)
+      · 对每个 (b,t,h) 计算其候选集合的 score, 写入 `all_scores[b,t,h,0:n_cand]`
+      · 候选集合由 `prev_selected_parents[b,t,h_kv,:]` 给出 (KV head 粒度共享)
+      · 采用固定 tile: 每批 32 parents * COMPRESSION_RATE(通常 16) children = 512
 
-    - Kernel 2.1b `htree_select_topk_shared_gqa_kernel`（non-bottom layers only）
-      · 对每个 (b,t,h_kv) 在同组 NUM_GROUPS 个 query heads 上做 NSA-style 聚合：
+    - Kernel 2.1b `htree_select_topk_shared_gqa_kernel` (non-bottom layers only)
+      · 对每个 (b,t,h_kv) 在同组 NUM_GROUPS 个 query heads 上做 NSA-style 聚合: 
                 importance_i = Σ_g exp(score_{g,i} - lse_g)
-      · 强制选中 “rightmost” 候选（pos=n_cand-1）以保证因果边界一致
-      · stable Top-K：对 importance 做 bit-packing（把 buffer pos 编进低位），再用 bitonic sort 选 Top-K
-      · 输出 `topk_positions[b,t,h_kv,:]`（buffer position，-1 padding）
+      · 强制选中 “rightmost” 候选 (pos=n_cand-1)以保证因果边界一致
+      · stable Top-K: 对 importance 做 bit-packing (把 buffer pos 编进低位), 再用 bitonic sort 选 Top-K
+      · 输出 `topk_positions[b,t,h_kv,:]` (buffer position, -1 padding)
 
-    - Kernel 2.1.2 `htree_mask_topk_scores_kernel`（non-bottom layers only）
-      · 将 Top-K 对应 buffer 位置的 score 覆写为 `HTREE_SCORE_NEG_INF`（对同组所有 query heads 生效）
-      · 目的：Kernel 2.2 只需用阈值判断 `score_valid`，避免额外的 topk_hit 广播比较
+    - Kernel 2.1.2 `htree_mask_topk_scores_kernel` (non-bottom layers only)
+      · 将 Top-K 对应 buffer 位置的 score 覆写为 `HTREE_SCORE_NEG_INF` (对同组所有 query heads 生效)
+      · 目的: Kernel 2.2 只需用阈值判断 `score_valid`, 避免额外的 topk_hit 广播比较
 
     - Kernel 2.2 `htree_accumulate_non_topk_kernel`
-      · 流式加载 V，累积非 Top-K 节点（底层累积全部候选）
+      · 流式加载 V, 累积非 Top-K 节点 (底层累积全部候选)
 
     - Kernel 2.3 `htree_merge_to_global_kernel_v2`
-      · online-softmax 合并：把当前层 `(layer_max, layer_sum, layer_output)` 合并到全局状态
+      · online-softmax 合并: 把当前层 `(layer_max, layer_sum, layer_output)` 合并到全局状态
 
-    - Kernel 2.4 `htree_compute_next_parents_kernel`（non-bottom layers only）
-      · 把 `topk_positions`（buffer pos）映射回下一层的 node indices，并做升序排序
+    - Kernel 2.4 `htree_compute_next_parents_kernel` (non-bottom layers only)
+      · 把 `topk_positions` (buffer pos)映射回下一层的 node indices, 并做升序排序
       · 得到下一层的 `prev_selected_parents`
 
   Phase 4: Final Normalize
@@ -56,17 +56,17 @@ import triton
 import triton.language as tl
 
 # ==========================================
-# 全局常量（数值约定）
+# 全局常量 (数值约定)
 # ==========================================
 
 # 作为“负无穷/被屏蔽”的统一 sentinel 分数。
-# 关系：所有被屏蔽/无效位置的 score 必须 <= HTREE_SCORE_NEG_INF。
+# 关系: 所有被屏蔽/无效位置的 score 必须 <= HTREE_SCORE_NEG_INF。
 HTREE_SCORE_NEG_INF: float = -1.0e10
 
 # 判定 score 是否“有效”的阈值。
-# 关系：HTREE_SCORE_VALID_THRESHOLD 必须严格大于 HTREE_SCORE_NEG_INF，
+# 关系: HTREE_SCORE_VALID_THRESHOLD 必须严格大于 HTREE_SCORE_NEG_INF, 
 # 从而能用 `score > HTREE_SCORE_VALID_THRESHOLD` 区分出被屏蔽(-1e10)的项。
-# 这里沿用原实现的经验值：-0.9e10。
+# 这里沿用原实现的经验值: -0.9e10。
 HTREE_SCORE_VALID_THRESHOLD: float = HTREE_SCORE_NEG_INF * 0.9
 
 # ==========================================
@@ -291,8 +291,8 @@ def htree_compute_scores_kernel(
     scale,
 ):
     """
-    Kernel 2.1 (scores only): 计算所有候选节点的 attention scores，写入 all_scores。
-    - parents / num_candidates 以 KV head 粒度共享（H_kv），同组 query heads 共享候选集合。
+    Kernel 2.1 (scores only): 计算所有候选节点的 attention scores, 写入 all_scores。
+    - parents / num_candidates 以 KV head 粒度共享 (H_kv), 同组 query heads 共享候选集合。
     Grid: (T, B*H)
     """
     i_t = tl.program_id(0)
@@ -304,7 +304,7 @@ def htree_compute_scores_kernel(
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
     PARENTS_PER_BATCH: tl.constexpr = 32
-    # Per-batch candidates: 32 parents × COMPRESSION_RATE children.
+    # Per-batch candidates: 32 parents * COMPRESSION_RATE children.
     # This is 512 when COMPRESSION_RATE=16.
     BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
     
@@ -367,7 +367,7 @@ def htree_compute_scores_kernel(
     q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
     
     # ========================================
-    # 阶段 3: 批次遍历，加载 K 并计算 scores，同时维护 Streaming Top-K
+    # 阶段 3: 批次遍历, 加载 K 并计算 scores, 同时维护 Streaming Top-K
     # ========================================
 
     # NOTE: all_scores is [B, T, H, MAX_CANDIDATES]. When T*H*MAX_CANDIDATES
@@ -409,7 +409,7 @@ def htree_compute_scores_kernel(
             (o_child_offset < num_valid_children_per_parent[:, None])
         )
         
-        # rightmost mask（用于强制选中最右节点）
+        # rightmost mask (用于强制选中最右节点)
         rightmost_mask_2d = (
             (parent_indices[:, None] == rightmost_parent_idx)
             & (o_child_offset == rightmost_child_idx)
@@ -504,7 +504,6 @@ def htree_select_topk_shared_gqa_kernel(
     i_h_kv = i_bhk % H_kv    # KV Head Index in Batch
 
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
-    #TODO use make_block_ptr
     if is_bottom_layer:
         # Bottom layer: no need to select for next layer.
         T_i64 = T.to(tl.int64)
@@ -813,7 +812,7 @@ def htree_accumulate_non_topk_kernel(
     SCORE_VALID_THRESHOLD: tl.constexpr,
 ):
     """
-    Kernel 2.2: 流式加载 V，累积非 Top-K 节点（Stream Accumulate）
+    Kernel 2.2: 流式加载 V, 累积非 Top-K 节点 (Stream Accumulate)
     Grid: (T, B*H)
     """
     i_t = tl.program_id(0)
@@ -849,10 +848,10 @@ def htree_accumulate_non_topk_kernel(
     )
     
     # ========================================
-    # 阶段 3: 流式加载 V 并累积（Stream Accumulate）
+    # 阶段 3: 流式加载 V 并累积 (Stream Accumulate)
     # ========================================
     
-    # 逐父节点在线累计，避免物化全量 values_2d [32, 16, V]
+    # 逐父节点在线累计, 避免物化全量 values_2d [32, 16, V]
     cur_max = tl.full((), -1e10, dtype=tl.float32)
     cur_sum = tl.zeros((), dtype=tl.float32)
     cur_output = tl.zeros([V], dtype=tl.float32)
@@ -871,7 +870,7 @@ def htree_accumulate_non_topk_kernel(
         # ========================================
         # Stream Accumulate: 逐父节点流式累积
         # ========================================
-        # 遍历当前批次的 32 个父节点，逐个处理
+        # 遍历当前批次的 32 个父节点, 逐个处理
         for i_p in tl.static_range(PARENTS_PER_BATCH):
             # 加载当前父节点索引
             parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
@@ -898,11 +897,11 @@ def htree_accumulate_non_topk_kernel(
                 o_child = tl.arange(0, COMPRESSION_RATE)
                 child_valid_mask = o_child < num_valid_children
                 
-                # 计算全局位置（在 buffer 中的位置）
+                # 计算全局位置 (在 buffer 中的位置)
                 global_pos_base = i_batch * BC + i_p * COMPRESSION_RATE
                 global_pos = global_pos_base + o_child
                 
-                # 候选有效性（不超过实际候选数且子节点有效）
+                # 候选有效性 (不超过实际候选数且子节点有效)
                 child_candidate_mask = child_valid_mask & (global_pos < n_cand)
                 
                 # 加载当前子节点的 scores [16]
@@ -912,7 +911,7 @@ def htree_accumulate_non_topk_kernel(
                     other=-1e10
                 )
 
-                # 非底层：Top-K 位置已在 Kernel 2.1.2 中写成 -1e10，因此这里用 score_valid 过滤即可
+                # 非底层: Top-K 位置已在 Kernel 2.1.2 中写成 -1e10, 因此这里用 score_valid 过滤即可
                 if not is_bottom_layer:
                     score_valid = child_scores > SCORE_VALID_THRESHOLD
                     final_child_mask = child_candidate_mask & score_valid
@@ -930,7 +929,7 @@ def htree_accumulate_non_topk_kernel(
                 parent_sum = tl.sum(exp_scores)
                 parent_out = tl.sum(exp_scores[:, None] * masked_values, axis=0)
                 
-                # 与累计状态合并（online softmax）
+                # 与累计状态合并 (online softmax)
                 has_contribution = parent_sum > 0
                 if has_contribution:
                     new_max = tl.maximum(cur_max, parent_max)
@@ -1098,7 +1097,7 @@ def _compare_and_swap_single(
     n_dims: tl.constexpr,
     n_outer: tl.constexpr,
 ):
-    """单数组 compare-and-swap，不追踪索引（索引已编码在值的低位）"""
+    """单数组 compare-and-swap, 不追踪索引 (索引已编码在值的低位)"""
     shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
     y = tl.reshape(x, shape)
     mask = tl.arange(0, 2)[None, :, None]
@@ -1143,7 +1142,7 @@ def sort_single(
     n_outer: tl.constexpr,
     descending: tl.constexpr = tl.core.CONSTEXPR_0,
 ):
-    """单数组 bitonic sort（不返回索引，用于 Bit-Packing Top-K）"""
+    """单数组 bitonic sort (不返回索引, 用于 Bit-Packing Top-K)"""
     for i in tl.static_range(1, n_dims + 1):
         x = _bitonic_merge_single(x, i, 2 if i < n_dims else descending, n_dims, n_outer)
     return x
@@ -1235,9 +1234,9 @@ def htree_forward_v2(
     htree 前向传播 V2 (支持 Group Query Attention)
     
     Args:
-        q: [B, T, H, K] - Query，H 个头
-        k: [B, T, H_kv, K] - Key，H_kv 个头 (H_kv <= H, H % H_kv == 0)
-        v: [B, T, H_kv, V] - Value，H_kv 个头
+        q: [B, T, H, K] - Query, H 个头
+        k: [B, T, H_kv, K] - Key, H_kv 个头 (H_kv <= H, H % H_kv == 0)
+        v: [B, T, H_kv, V] - Value, H_kv 个头
         compression_rate: 16
         max_top_nodes: 8192
         top_k_per_layer: 512
@@ -1248,9 +1247,9 @@ def htree_forward_v2(
         output: [B, T, H, V]
     
     Note:
-    - 当 H_kv == H 时，等价于 Multi-Head Attention (MHA)
-    - 当 H_kv == 1 时，等价于 Multi-Query Attention (MQA)
-    - 当 1 < H_kv < H 时，为 Group Query Attention (GQA)
+    - 当 H_kv == H 时, 等价于 Multi-Head Attention (MHA)
+    - 当 H_kv == 1 时, 等价于 Multi-Query Attention (MQA)
+    - 当 1 < H_kv < H 时, 为 Group Query Attention (GQA)
     """
     B, T, H, K = q.shape
     H_kv = k.shape[2]  # KV 头数量
@@ -1370,7 +1369,7 @@ def htree_forward_v2(
     
     t_indices = torch.arange(T, dtype=torch.int32, device=device)  # [T]
     rightmost_indices = t_indices // top_layer_power  # [T] 顶层最右侧节点索引
-    # 虚拟父节点数量：每个虚拟父节点展开成16个顶层节点
+    # 虚拟父节点数量: 每个虚拟父节点展开成16个顶层节点
     num_virtual_parents = rightmost_indices // compression_rate + 1  # [T]
     
     # [T, TOP_K]
@@ -1529,7 +1528,7 @@ def htree_forward_v2(
         
         nvtx.range_pop()
 
-        # 更新 parent indices（用当前层 prev_selected_parents + topk_positions 计算下一层 parents）
+        # 更新 parent indices (用当前层 prev_selected_parents + topk_positions 计算下一层 parents)
         if not is_bottom_layer:
             nvtx.range_push("Post_ComputeNextParents")
 
