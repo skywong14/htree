@@ -49,7 +49,7 @@ Pipeline
       · `output = global_output / global_sum`
 """
 
-from typing import Optional, Dict, Tuple
+from typing import Optional
 import torch
 import torch.cuda.nvtx as nvtx
 import triton
@@ -227,45 +227,21 @@ def load_k_with_rope_v2(
     return k_rope_1, k_rope_2
 
 
-@triton.jit
-def load_v_v2(
-    layer_v,
-    i_b,
-    i_h_kv,
-    child_start,
-    N_layer: tl.constexpr,
-    H_kv: tl.constexpr,
-    V: tl.constexpr,
-    COMPRESSION_RATE: tl.constexpr,
-):
-    """加载 16 个 token 的 V"""
-    v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
-    
-    v_block_ptrs = tl.make_block_ptr(
-        base=v_base,
-        shape=(N_layer, V),
-        strides=(H_kv * V, 1),
-        offsets=(child_start, 0),
-        block_shape=(COMPRESSION_RATE, V),
-        order=(1, 0)
-    )
-    v_vals = tl.load(v_block_ptrs, boundary_check=(0, 1))
-    
-    return v_vals
-
-
 # ==========================================
 # Kernel 2.1: Compute Scores & Select Top-K
 # ==========================================
 
 # @triton.autotune(
 #     configs=[
+#         triton.Config({}, num_warps=2, num_stages=2),
 #         triton.Config({}, num_warps=4, num_stages=2),
-#         triton.Config({}, num_warps=8, num_stages=2),
 #         triton.Config({}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=8, num_stages=2),
 #         triton.Config({}, num_warps=8, num_stages=3),
 #     ],
-#     key=['B', 'H', 'K']
+#     # Key by head grouping + rope/compression structure + bottom-vs-non-bottom.
+#     # Avoid keying on T to prevent excessive cache fragmentation.
+#     key=['K', 'NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K', 'layer_idx'],
 # )
 @triton.jit
 def htree_compute_scores_kernel(
@@ -471,6 +447,17 @@ def htree_compute_scores_kernel(
 # Kernel 2.1b: Shared Top-K Selection (NSA-style, per KV head)
 # ==========================================
 
+# @triton.autotune(
+#     configs=[
+#         triton.Config({}, num_warps=2, num_stages=1),
+#         triton.Config({}, num_warps=2, num_stages=2),
+#         triton.Config({}, num_warps=4, num_stages=1),
+#         triton.Config({}, num_warps=4, num_stages=2),
+#         triton.Config({}, num_warps=8, num_stages=1),
+#         triton.Config({}, num_warps=8, num_stages=2),
+#     ],
+#     key=['NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K', 'layer_idx'],
+# )
 @triton.jit
 def htree_select_topk_shared_gqa_kernel(
     all_scores,  # [B, T, H, MAX_CANDIDATES]
@@ -780,12 +767,19 @@ def htree_mask_topk_scores_kernel(
 
 # @triton.autotune(
 #     configs=[
-#         triton.Config({}, num_warps=4, num_stages=2),
-#         triton.Config({}, num_warps=8, num_stages=2),
-#         triton.Config({}, num_warps=4, num_stages=3),
-#         triton.Config({}, num_warps=8, num_stages=3),
+#         # Tune across V blocking (BV), num_warps and num_stages.
+#         # Keep the search space small-ish to avoid excessive compile time.
+#         triton.Config({'BV': 32}, num_warps=4, num_stages=2),
+#         triton.Config({'BV': 32}, num_warps=8, num_stages=2),
+#         triton.Config({'BV': 64}, num_warps=4, num_stages=2),
+#         triton.Config({'BV': 64}, num_warps=8, num_stages=2),
+#         triton.Config({'BV': 64}, num_warps=4, num_stages=3),
+#         triton.Config({'BV': 128}, num_warps=4, num_stages=2),
+#         triton.Config({'BV': 128}, num_warps=8, num_stages=2),
+#         triton.Config({'BV': 128}, num_warps=4, num_stages=3),
 #     ],
-#     key=['B', 'H', 'K']
+#     # Separate autotune decisions by value dim, group size, and bottom-vs-non-bottom.
+#     key=['V', 'NUM_GROUPS', 'layer_idx'],
 # )
 @triton.jit
 def htree_accumulate_non_topk_kernel(
@@ -805,6 +799,7 @@ def htree_accumulate_non_topk_kernel(
     H_kv: tl.constexpr,
     NUM_GROUPS: tl.constexpr,
     V: tl.constexpr,
+    BV: tl.constexpr,
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -812,50 +807,62 @@ def htree_accumulate_non_topk_kernel(
     SCORE_VALID_THRESHOLD: tl.constexpr,
 ):
     """
-    Kernel 2.2: 流式加载 V, 累积非 Top-K 节点 (Stream Accumulate)
-    Grid: (T, B*H)
+    Kernel 2.2 (GQA, KV-granularity, V-blocked): stream-load V and accumulate non-TopK nodes.
+
+    - Grid: (T, nVBlocks, B*H_kv)
+      where nVBlocks = ceil_div(V, BV).
+    - Each program handles one (b, t, h_kv) and one V slice [i_v*BV:(i_v+1)*BV),
+      and processes NUM_GROUPS query heads in the GQA group in a vectorized manner.
+    - Only i_v == 0 writes `layer_max/layer_sum` to avoid write conflicts; all i_v write `layer_output`.
     """
     i_t = tl.program_id(0)
-    i_bh = tl.program_id(1)
-    i_b = i_bh // H
-    i_h = i_bh % H
-    # GQA: 映射 Query 头索引到 KV 头索引
-    i_h_kv = i_h // NUM_GROUPS
+    i_v = tl.program_id(1)
+    i_bhk = tl.program_id(2)
+    i_b = i_bhk // H_kv
+    i_h_kv = i_bhk % H_kv
     
     is_bottom_layer: tl.constexpr = (layer_idx == 0)
     PARENTS_PER_BATCH: tl.constexpr = 32
     BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # 512 when COMPRESSION_RATE=16
-    
+
     rightmost_idx = i_t // layer_power
-    
+
     # ========================================
     # 阶段 1: 加载元数据
     # ========================================
-    
+
     T_i64 = T.to(tl.int64)
     num_cand_offset = (
         i_b.to(tl.int64) * T_i64 * H_kv
         + i_t.to(tl.int64) * H_kv
         + i_h_kv.to(tl.int64)
     )
-    n_cand = tl.load(num_candidates + num_cand_offset)
-    
-    # Same overflow issue as Kernel 2.1: promote linear indexing to int64.
-    buffer_base = (
+    n_cand = tl.load(num_candidates + num_cand_offset).to(tl.int32)
+
+    # Head ids in this GQA group (query-head granularity)
+    head_ids = (i_h_kv * NUM_GROUPS + tl.arange(0, NUM_GROUPS)).to(tl.int64)  # [G]
+
+    # Base for all_scores: [B, T, H, MAX_CANDIDATES]
+    scores_bt_base = (
         i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
         + i_t.to(tl.int64) * H * MAX_CANDIDATES
-        + i_h.to(tl.int64) * MAX_CANDIDATES
     )
-    
+
+    # V-slice for this program
+    v_start = (i_v * BV).to(tl.int64)
+    o_v = tl.arange(0, BV).to(tl.int64)
+    v_cols = v_start + o_v  # [BV]
+    v_mask = v_cols < V
+
     # ========================================
-    # 阶段 3: 流式加载 V 并累积 (Stream Accumulate)
+    # 阶段 2: 流式加载 V 并累积 (Stream Accumulate, vectorized over G)
     # ========================================
-    
-    # 逐父节点在线累计, 避免物化全量 values_2d [32, 16, V]
-    cur_max = tl.full((), -1e10, dtype=tl.float32)
-    cur_sum = tl.zeros((), dtype=tl.float32)
-    cur_output = tl.zeros([V], dtype=tl.float32)
-    
+
+    # Online-softmax state per query head in this GQA group.
+    cur_max = tl.full([NUM_GROUPS], -1e10, dtype=tl.float32)
+    cur_sum = tl.zeros([NUM_GROUPS], dtype=tl.float32)
+    cur_output = tl.zeros([NUM_GROUPS, BV], dtype=tl.float32)
+
     prev_sel_base = (
         i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
         + i_t.to(tl.int64) * H_kv * TOP_K
@@ -864,101 +871,108 @@ def htree_accumulate_non_topk_kernel(
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
     valid_parent_list_mask = parent_list >= 0
     num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
-    num_batches = (num_valid_parents + 31) // 32
+    num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
 
+    # use a runtime loop for i_batch to avoid compile-time unrolling explosion.
     for i_batch in range(num_batches):
-        # ========================================
-        # Stream Accumulate: 逐父节点流式累积
-        # ========================================
-        # 遍历当前批次的 32 个父节点, 逐个处理
+        # Iterate over 32 parents in this batch (fixed tile).
         for i_p in tl.static_range(PARENTS_PER_BATCH):
-            # 加载当前父节点索引
-            parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
-            
-            # 检查父节点有效性
-            if parent_idx >= 0:
-                child_start = parent_idx * COMPRESSION_RATE
-                
-                # 加载当前父节点的 V values [16, V] (使用 GQA 映射的 i_h_kv)
-                v_vals = load_v_v2(
-                    layer_v, i_b, i_h_kv, child_start,
-                    N_layer, H_kv, V, COMPRESSION_RATE
-                )
-                
-                # 计算当前父节点的有效子节点数
-                is_rightmost = (parent_idx == rightmost_idx // COMPRESSION_RATE)
-                num_valid_children = tl.where(
-                    is_rightmost,
-                    (rightmost_idx % COMPRESSION_RATE) + 1,
-                    COMPRESSION_RATE
-                )
-                
-                # 构建子节点有效性 mask [16]
-                o_child = tl.arange(0, COMPRESSION_RATE)
-                child_valid_mask = o_child < num_valid_children
-                
-                # 计算全局位置 (在 buffer 中的位置)
-                global_pos_base = i_batch * BC + i_p * COMPRESSION_RATE
-                global_pos = global_pos_base + o_child
-                
-                # 候选有效性 (不超过实际候选数且子节点有效)
-                child_candidate_mask = child_valid_mask & (global_pos < n_cand)
-                
-                # 加载当前子节点的 scores [16]
-                child_scores = tl.load(
-                    all_scores + buffer_base + global_pos,
-                    mask=o_child < COMPRESSION_RATE,
-                    other=-1e10
-                )
+            parent_idx = tl.load(
+                prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p
+            ).to(tl.int32)
 
-                # 非底层: Top-K 位置已在 Kernel 2.1.2 中写成 -1e10, 因此这里用 score_valid 过滤即可
-                if not is_bottom_layer:
-                    score_valid = child_scores > SCORE_VALID_THRESHOLD
-                    final_child_mask = child_candidate_mask & score_valid
-                else:
-                    final_child_mask = child_candidate_mask
-                
-                # 应用 mask
-                masked_scores = tl.where(final_child_mask, child_scores, -1e10)
-                masked_values = tl.where(final_child_mask[:, None], v_vals, 0.0)
-                
-                # 计算当前父节点的 softmax 分子
-                parent_max = tl.max(masked_scores)
-                exp_scores = tl.exp(masked_scores - parent_max)
-                exp_scores = tl.where(final_child_mask, exp_scores, 0.0)
-                parent_sum = tl.sum(exp_scores)
-                parent_out = tl.sum(exp_scores[:, None] * masked_values, axis=0)
-                
-                # 与累计状态合并 (online softmax)
-                has_contribution = parent_sum > 0
-                if has_contribution:
-                    new_max = tl.maximum(cur_max, parent_max)
-                    scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
-                    scale_parent = tl.exp(parent_max - new_max)
-                    
-                    cur_sum = cur_sum * scale_cur + parent_sum * scale_parent
-                    cur_output = cur_output * scale_cur + parent_out * scale_parent
-                    cur_max = new_max
+            valid_parent = parent_idx >= 0
+
+            # Child range in this parent
+            child_start = (parent_idx * COMPRESSION_RATE).to(tl.int32)
+            child_rows_i32 = child_start + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
+            row_mask = child_rows_i32 < N_layer
+
+            # TODO use make_block_ptr to load V
+            # Load V slice [COMPRESSION_RATE, BV] once (shared across G query heads).
+            # layer_v is [B, N_layer, H_kv, V] contiguous.
+            v_base = (
+                layer_v
+                + i_b.to(tl.int64) * N_layer * H_kv * V
+                + i_h_kv.to(tl.int64) * V
+            )
+            v_ptrs = v_base + child_rows_i32.to(tl.int64)[:, None] * (H_kv * V) + v_cols[None, :]
+            v_vals = tl.load(
+                v_ptrs,
+                mask=valid_parent & row_mask[:, None] & v_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)  # [CR, BV]
+
+            # Number of valid children for the rightmost parent.
+            is_rightmost = valid_parent & (parent_idx == (rightmost_idx // COMPRESSION_RATE))
+            num_valid_children = tl.where(
+                is_rightmost,
+                (rightmost_idx % COMPRESSION_RATE) + 1,
+                COMPRESSION_RATE,
+            ).to(tl.int32)
+            child_valid_mask = row_mask & (tl.arange(0, COMPRESSION_RATE) < num_valid_children)  # [CR]
+
+            # Global buffer positions for these children.
+            global_pos_base = i_batch * BC + i_p * COMPRESSION_RATE
+            global_pos = global_pos_base.to(tl.int32) + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
+            child_candidate_mask = valid_parent & child_valid_mask & (global_pos < n_cand)  # [CR]
+
+            # Load scores for all G query heads: [G, CR]
+            pos_i64 = global_pos.to(tl.int64)
+            head_off = head_ids[:, None] * MAX_CANDIDATES + pos_i64[None, :]
+            s_ptrs = all_scores + scores_bt_base + head_off
+            scores = tl.load(
+                s_ptrs,
+                mask=child_candidate_mask[None, :],
+                other=-1e10,
+            ).to(tl.float32)
+
+            if not is_bottom_layer:
+                score_valid = scores > SCORE_VALID_THRESHOLD
+                final_mask = child_candidate_mask[None, :] & score_valid
+            else:
+                final_mask = child_candidate_mask[None, :]
+
+            masked_scores = tl.where(final_mask, scores, -1e10)
+            parent_max = tl.max(masked_scores, axis=1)  # [G]
+            exp_scores = tl.exp(masked_scores - parent_max[:, None])
+            exp_scores = tl.where(final_mask, exp_scores, 0.0)
+            parent_sum = tl.sum(exp_scores, axis=1)  # [G]
+
+            # Weighted sum over children for this V slice.
+            # Use explicit reduction instead of tl.dot: G is small (4/8) and tl.dot requires M>=16.
+            parent_out = tl.sum(exp_scores[:, :, None] * v_vals[None, :, :], axis=1)  # [G, BV]
+
+            # Online softmax merge (vectorized over G).
+            has_contribution = parent_sum > 0
+            new_max = tl.maximum(cur_max, parent_max)
+            scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
+            scale_parent = tl.exp(parent_max - new_max)
+
+            merged_sum = cur_sum * scale_cur + parent_sum * scale_parent
+            merged_out = cur_output * scale_cur[:, None] + parent_out * scale_parent[:, None]
+
+            cur_max = tl.where(has_contribution, new_max, cur_max)
+            cur_sum = tl.where(has_contribution, merged_sum, cur_sum)
+            cur_output = tl.where(has_contribution[:, None], merged_out, cur_output)
 
     # ========================================
-    # 阶段 4: 存储结果
+    # 阶段 3: 存储结果
     # ========================================
-    
-    state_offset = (
-        i_b.to(tl.int64) * T_i64 * H
-        + i_t.to(tl.int64) * H
-        + i_h.to(tl.int64)
-    )
-    tl.store(layer_max + state_offset, cur_max)
-    tl.store(layer_sum + state_offset, cur_sum)
-    
-    output_offset = (
+
+    # Only one V-slice program writes scalar states to avoid write conflicts.
+    if i_v == 0:
+        state_base = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
+        tl.store(layer_max + state_base + head_ids, cur_max)
+        tl.store(layer_sum + state_base + head_ids, cur_sum)
+
+    # Store output slice for each query head in the group.
+    out_base = (
         i_b.to(tl.int64) * T_i64 * H * V
         + i_t.to(tl.int64) * H * V
-        + i_h.to(tl.int64) * V
     )
-    o_v = tl.arange(0, V)
-    tl.store(layer_output + output_offset + o_v, cur_output, mask=o_v < V)
+    out_ptrs = layer_output + out_base + head_ids[:, None] * V + v_cols[None, :]
+    tl.store(out_ptrs, cur_output, mask=v_mask[None, :])
 
 
 # ==========================================
@@ -1484,8 +1498,12 @@ def htree_forward_v2(
         start_k22 = torch.cuda.Event(enable_timing=True)
         end_k22 = torch.cuda.Event(enable_timing=True)
         start_k22.record()
-        
-        htree_accumulate_non_topk_kernel[grid](
+
+        # GQA-efficient K2.2: KV-granularity + V-blocked grid.
+        BV = min(128, max(16, triton.next_power_of_2(V)))
+        grid_k22 = (T, triton.cdiv(V, BV), B * H_kv)
+
+        htree_accumulate_non_topk_kernel[grid_k22](
             v_layer,
             prev_selected_parents,
             all_scores, num_candidates,
@@ -1494,7 +1512,7 @@ def htree_forward_v2(
             layer_power=layer_power,
             B=B, T=T, H=H, H_kv=H_kv,
             NUM_GROUPS=H // H_kv,
-            V=V, N_layer=N_layer,
+            V=V, BV=BV, N_layer=N_layer,
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
             MAX_CANDIDATES=MAX_CANDIDATES,

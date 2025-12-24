@@ -110,7 +110,11 @@ def run_benchmarks(args: argparse.Namespace) -> None:
 
     torch.cuda.set_device(args.gpu)
     device = torch.device(f"cuda:{args.gpu}")
-    dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[args.dtype]
 
     torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -174,6 +178,18 @@ def run_benchmarks(args: argparse.Namespace) -> None:
     print(f"  htree: {_ok(f'{htree_ms:.3f} ms')}")
     print(f"  NSA  : {_ok(f'{nsa_ms:.3f} ms')}")
     print(_hdr("Params summary:"))
+    print(
+        "  experiment: "
+        f"B={args.batch}, "
+        f"T={args.seq_len}, "
+        f"HQ={args.hq}, "
+        f"H_kv={args.h_kv}, "
+        f"K={args.k_dim}, "
+        f"V={args.v_dim}, "
+        f"dtype={args.dtype}, "
+        f"block_size={args.block_size}, "
+        f"S(block_counts)={args.s_blocks}"
+    )
     print(
         "  htree: "
         f"compression_rate={args.htree_compression_rate}, "
@@ -253,7 +269,7 @@ def parse_args() -> argparse.Namespace:
         help="CUDA device index to use (after CUDA_VISIBLE_DEVICES remapping)",
     )
     parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--seq-len", type=int, default=40000)
+    parser.add_argument("--seq-len", type=int, default=120000)
     parser.add_argument("--hq", type=int, default=16, help="#query heads (HQ)")
     parser.add_argument("--h-kv", type=int, default=1, help="#key/value heads (H)")
     parser.add_argument("--k-dim", type=int, default=16)
@@ -265,7 +281,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--htree-max-top-nodes", type=int, default=8192)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=3)
-    parser.add_argument("--dtype", choices=["float16", "bfloat16"], default="float16")
+    parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float32")
     return parser.parse_args()
 
 
