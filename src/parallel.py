@@ -250,7 +250,7 @@ def htree_compute_scores_kernel(
      prev_selected_parents,  # [B, T_blocks, H_kv, TOP_K]
     cos_cache, sin_cache,  # [cache_size, K//2]
     # 输出 buffer
-    all_scores,  # [B, T, H, MAX_CANDIDATES]
+    all_scores,  # [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
     num_candidates,  # [B, T, H_kv]
     # 参数
     layer_idx: tl.constexpr,
@@ -269,16 +269,14 @@ def htree_compute_scores_kernel(
     """
     Kernel 2.1 (scores only): 计算所有候选节点的 attention scores, 写入 all_scores。
     - parents / num_candidates 以 KV head 粒度共享 (H_kv), 同组 query heads 共享候选集合。
-    Grid: (T, B*H)
+    - all_scores layout: all_scores[b, t, h_kv, pos, g]
+    Grid: (T, B*H_kv)
     """
     i_t = tl.program_id(0)
-    i_bh = tl.program_id(1)
-    i_b = i_bh // H
-    i_h = i_bh % H
-    # GQA: 映射 Query 头索引到 KV 头索引
-    i_h_kv = i_h // NUM_GROUPS
+    i_bhk = tl.program_id(1)
+    i_b = i_bhk // H_kv
+    i_h_kv = i_bhk % H_kv
     
-    is_bottom_layer: tl.constexpr = (layer_idx == 0)
     PARENTS_PER_BATCH: tl.constexpr = 32
     # Per-batch candidates: 32 parents * COMPRESSION_RATE children.
     # This is 512 when COMPRESSION_RATE=16.
@@ -315,9 +313,8 @@ def htree_compute_scores_kernel(
         + i_t.to(tl.int64) * H_kv
         + i_h_kv.to(tl.int64)
     )
-    # Only one lane per GQA group writes num_candidates to avoid write conflicts.
-    if (i_h % NUM_GROUPS) == 0:
-        tl.store(num_candidates + num_cand_offset, n_cand)
+    # KV-granularity: one program owns (b, t, h_kv), so no write conflict.
+    tl.store(num_candidates + num_cand_offset, n_cand)
     
     # ========================================
     # 阶段 2: 应用 RoPE 到 Query
@@ -325,34 +322,35 @@ def htree_compute_scores_kernel(
     
     rope_pos_q = tl.maximum(n_cand - 1, 0)
     
-    q_offset = (
+    # Vectorize over the NUM_GROUPS query heads in this KV group.
+    head_ids = (i_h_kv * NUM_GROUPS + tl.arange(0, NUM_GROUPS)).to(tl.int64)  # [G]
+    q_bt_base = (
         i_b.to(tl.int64) * T_i64 * H * K
         + i_t.to(tl.int64) * H * K
-        + i_h.to(tl.int64) * K
     )
-    o_k = tl.arange(0, K // 2)
-    
-    q1 = tl.load(q + q_offset + o_k)
-    q2 = tl.load(q + q_offset + (K // 2) + o_k)
+    o_k = tl.arange(0, K // 2).to(tl.int64)[None, :]  # [1, K/2]
+    q_head_base = q + q_bt_base + head_ids[:, None] * K  # [G, 1] pointer
+    q1 = tl.load(q_head_base + o_k)  # [G, K/2]
+    q2 = tl.load(q_head_base + (K // 2) + o_k)  # [G, K/2]
     
     rope_pos_q_i64 = rope_pos_q.to(tl.int64)
-    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + o_k)
-    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k)
+    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + tl.arange(0, K // 2))  # [K/2]
+    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + tl.arange(0, K // 2))  # [K/2]
     
-    q_rope_1 = (q1 * cos_q - q2 * sin_q) * scale
-    q_rope_2 = (q1 * sin_q + q2 * cos_q) * scale
+    q_rope_1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G, K/2]
+    q_rope_2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G, K/2]
     
     # ========================================
     # 阶段 3: 批次遍历, 加载 K 并计算 scores, 同时维护 Streaming Top-K
     # ========================================
 
-    # NOTE: all_scores is [B, T, H, MAX_CANDIDATES]. When T*H*MAX_CANDIDATES
-    # exceeds 2^31-1 (e.g., T=20000, H=16, MAX_CANDIDATES=8192), int32 offset math overflows and
-    # can produce negative pointers, causing illegal memory access. Promote to int64 explicitly.
-    buffer_base = (
-        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
-        + i_t.to(tl.int64) * H * MAX_CANDIDATES
-        + i_h.to(tl.int64) * MAX_CANDIDATES
+    # NOTE: all_scores is [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]. When
+    # T*H_kv*MAX_CANDIDATES*NUM_GROUPS exceeds 2^31-1, int32 offset math overflows.
+    # Promote to int64 explicitly.
+    scores_base = (
+        (i_b.to(tl.int64) * T_i64 * H_kv + i_t.to(tl.int64) * H_kv + i_h_kv.to(tl.int64))
+        * MAX_CANDIDATES
+        * NUM_GROUPS
     )
     
     # 3.1 初始化 Streaming Top-K 容器 (encoded scores)
@@ -392,8 +390,8 @@ def htree_compute_scores_kernel(
             & valid_child_mask_2d
         )
 
-        # 初始化当前批次的结果
-        scores_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], -1e10, dtype=tl.float32)
+        # 初始化当前批次的结果: [parents, children, groups]
+        scores_3d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE, NUM_GROUPS], -1e10, dtype=tl.float32)
         
         # 遍历 32 个父节点
         for i_p in tl.static_range(PARENTS_PER_BATCH):
@@ -414,32 +412,37 @@ def htree_compute_scores_kernel(
                     N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
                 )
                 
-                # 计算 scores
-                scores_16 = tl.sum(q_rope_1[None, :] * k_rope_1, axis=1) + \
-                           tl.sum(q_rope_2[None, :] * k_rope_2, axis=1)
+                # 计算 scores for all NUM_GROUPS heads: [G, CR]
+                scores_gcr = tl.sum(q_rope_1[:, None, :] * k_rope_1[None, :, :], axis=2) + \
+                             tl.sum(q_rope_2[:, None, :] * k_rope_2[None, :, :], axis=2)
+                # transpose to [CR, G] for convenient broadcasting into [P, CR, G]
+                scores_crg = tl.trans(scores_gcr)
                 
-                # 填充到 2D 结果
-                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH)[:, None] == i_p)
-                scores_2d = tl.where(
-                    is_current_parent & valid_child_mask_2d,
-                    scores_16[None, :],
-                    scores_2d
+                # 填充到 3D 结果
+                is_current_parent = (tl.arange(0, PARENTS_PER_BATCH) == i_p)[:, None, None]  # [P,1,1]
+                scores_3d = tl.where(
+                    is_current_parent & valid_child_mask_2d[:, :, None],
+                    scores_crg[None, :, :],
+                    scores_3d
                 )
         
-        # Flatten 到 [BC=512]
-        batch_scores = tl.reshape(scores_2d, [BC])
+        # Flatten 到 [BC=512, G]
+        batch_scores = tl.reshape(scores_3d, [BC, NUM_GROUPS])
         valid_child_mask_flat = tl.reshape(valid_child_mask_2d, [BC])
-        rightmost_mask_flat = tl.reshape(rightmost_mask_2d, [BC])
         
         # 应用 mask
-        batch_scores = tl.where(valid_child_mask_flat, batch_scores, -1e10)
+        batch_scores = tl.where(valid_child_mask_flat[:, None], batch_scores, -1e10)
         
         # 3.2 存储到 8192 buffer (供 Kernel 2.2 使用)
         buffer_offset = i_batch * BC
         o_bc = tl.arange(0, BC)
-        store_mask = (buffer_offset + o_bc) < MAX_CANDIDATES
+        pos = buffer_offset + o_bc
+        store_mask = pos < MAX_CANDIDATES
         
-        tl.store(all_scores + buffer_base + buffer_offset + o_bc, batch_scores, mask=store_mask)
+        pos_i64 = pos.to(tl.int64)
+        g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)
+        ptrs = all_scores + scores_base + pos_i64[:, None] * NUM_GROUPS + g_ids[None, :]
+        tl.store(ptrs, batch_scores, mask=store_mask[:, None])
     # No Top-K output here.
 
 
@@ -460,7 +463,7 @@ def htree_compute_scores_kernel(
 # )
 @triton.jit
 def htree_select_topk_shared_gqa_kernel(
-    all_scores,  # [B, T, H, MAX_CANDIDATES]
+    all_scores,  # [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
     num_candidates,  # [B, T, H_kv]
     topk_positions,  # [B, T, H_kv, TOP_K] (buffer positions)
     layer_idx: tl.constexpr,
@@ -527,17 +530,17 @@ def htree_select_topk_shared_gqa_kernel(
     PARENTS_PER_BATCH: tl.constexpr = 32
     BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
 
-    # Base pointers for all_scores (per query head)
-    # all_scores is [B, T, H, MAX_CANDIDATES] contiguous.
-    scores_bt_base = (
-        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
-        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+    # Base for all_scores: [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
+    scores_base = (
+        (i_b.to(tl.int64) * T_i64 * H_kv + i_t.to(tl.int64) * H_kv + i_h_kv.to(tl.int64))
+        * MAX_CANDIDATES
+        * NUM_GROUPS
     )
+    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)  # [G]
 
     # ------------------------------------------------
     # Pass 1: compute lse_g for each head in the group
     # ------------------------------------------------
-    lse = tl.full([NUM_GROUPS], 0.0, dtype=tl.float32)
     m = tl.full([NUM_GROUPS], float('-inf'), dtype=tl.float32)
     acc = tl.zeros([NUM_GROUPS], dtype=tl.float32)
 
@@ -547,26 +550,20 @@ def htree_select_topk_shared_gqa_kernel(
         o_bc = tl.arange(0, BC)
         pos = buf_off + o_bc
         valid_pos = pos < n_cand
+        pos_i64 = pos.to(tl.int64)
+        s_ptrs = all_scores + scores_base + pos_i64[:, None] * NUM_GROUPS + g_ids[None, :]
+        b_s = tl.load(s_ptrs, mask=valid_pos[:, None], other=float('-inf')).to(tl.float32)  # [BC, G]
 
-        # Update each head's (m, acc)
-        for g in tl.static_range(NUM_GROUPS):
-            sel = tl.arange(0, NUM_GROUPS) == g
-            m_g = tl.max(tl.where(sel, m, float('-inf')), axis=0)
-            acc_g = tl.sum(tl.where(sel, acc, 0.0), axis=0)
+        b_m = tl.max(b_s, axis=0)  # [G]
+        m_new = tl.maximum(m, b_m)
+        r = tl.exp(m - m_new)
 
-            i_h = i_h_kv * NUM_GROUPS + g
-            s_ptrs = all_scores + scores_bt_base + i_h.to(tl.int64) * MAX_CANDIDATES + pos.to(tl.int64)
-            b_s = tl.load(s_ptrs, mask=valid_pos, other=float('-inf')).to(tl.float32)
+        p = tl.exp(b_s - m_new[None, :])
+        p = tl.where(valid_pos[:, None], p, 0.0)
+        acc = acc * r + tl.sum(p, axis=0)
+        m = m_new
 
-            m_new = tl.maximum(m_g, tl.max(b_s, axis=0))
-            # rescale old acc to new max
-            r = tl.exp(m_g - m_new)
-            p = tl.exp(b_s - m_new)
-            acc_new = acc_g * r + tl.sum(p, axis=0)
-            m = tl.where(sel, m_new, m)
-            acc = tl.where(sel, acc_new, acc)
-
-    lse = m + tl.log(acc)
+    lse = m + tl.log(acc)  # [G]
 
     # ------------------------------------------------
     # Pass 2: compute importance per position and pick Top-K (stable)
@@ -583,19 +580,13 @@ def htree_select_topk_shared_gqa_kernel(
         o_bc = tl.arange(0, BC)
         pos = (buf_off + o_bc).to(tl.int32)
         valid_pos = pos < n_cand
+        pos_i64 = pos.to(tl.int64)
+        s_ptrs = all_scores + scores_base + pos_i64[:, None] * NUM_GROUPS + g_ids[None, :]
+        b_s = tl.load(s_ptrs, mask=valid_pos[:, None], other=float('-inf')).to(tl.float32)  # [BC, G]
 
-        imp = tl.zeros([BC], dtype=tl.float32)
-        for g in tl.static_range(NUM_GROUPS):
-            sel = tl.arange(0, NUM_GROUPS) == g
-            lse_g = tl.max(tl.where(sel, lse, float('-inf')), axis=0)
-            i_h = i_h_kv * NUM_GROUPS + g
-            s_ptrs = all_scores + scores_bt_base + i_h.to(tl.int64) * MAX_CANDIDATES + pos.to(tl.int64)
-            b_s = tl.load(s_ptrs, mask=valid_pos, other=float('-inf')).to(tl.float32)
-            b_p = tl.exp(b_s - lse_g)
-            b_p = tl.where(valid_pos, b_p, 0.0)
-            imp += b_p
-
-        # mask invalid positions
+        b_p = tl.exp(b_s - lse[None, :])  # [BC, G]
+        b_p = tl.where(valid_pos[:, None], b_p, 0.0)
+        imp = tl.sum(b_p, axis=1)  # [BC]
         imp = tl.where(valid_pos, imp, float('-inf'))
         # force rightmost selected
         imp = tl.where(pos == rightmost_pos, 1e3, imp)
@@ -719,7 +710,7 @@ def htree_compute_next_parents_kernel(
 
 @triton.jit
 def htree_mask_topk_scores_kernel(
-    all_scores,  # [B, T, H, MAX_CANDIDATES]
+    all_scores,  # [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
     topk_positions,  # [B, T, H_kv, TOP_K] (buffer positions, shared per KV head)
     B: tl.constexpr,
     T,
@@ -750,15 +741,15 @@ def htree_mask_topk_scores_kernel(
     valid = (pos_i32 >= 0) & (pos_i32 < MAX_CANDIDATES)
 
     # Spread the shared mask to all query heads in this KV group.
-    scores_bt_base = (
-        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
-        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+    scores_base = (
+        (i_b.to(tl.int64) * T_i64 * H_kv + i_t.to(tl.int64) * H_kv + i_h_kv.to(tl.int64))
+        * MAX_CANDIDATES
+        * NUM_GROUPS
     )
-    for g in tl.static_range(NUM_GROUPS):
-        i_h = (i_h_kv * NUM_GROUPS + g).to(tl.int64)
-        buffer_base = scores_bt_base + i_h * MAX_CANDIDATES
-        ptrs = all_scores + buffer_base + pos_i32.to(tl.int64)
-        tl.store(ptrs, tl.full([TOP_K], NEG_INF, dtype=tl.float32), mask=valid)
+    pos_i64 = pos_i32.to(tl.int64)
+    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)
+    ptrs = all_scores + scores_base + pos_i64[:, None] * NUM_GROUPS + g_ids[None, :]
+    tl.store(ptrs, tl.full([TOP_K, NUM_GROUPS], NEG_INF, dtype=tl.float32), mask=valid[:, None])
 
 
 # ==========================================
@@ -767,16 +758,10 @@ def htree_mask_topk_scores_kernel(
 
 # @triton.autotune(
 #     configs=[
-#         # Tune across V blocking (BV), num_warps and num_stages.
-#         # Keep the search space small-ish to avoid excessive compile time.
-#         triton.Config({'BV': 32}, num_warps=4, num_stages=2),
-#         triton.Config({'BV': 32}, num_warps=8, num_stages=2),
-#         triton.Config({'BV': 64}, num_warps=4, num_stages=2),
-#         triton.Config({'BV': 64}, num_warps=8, num_stages=2),
-#         triton.Config({'BV': 64}, num_warps=4, num_stages=3),
-#         triton.Config({'BV': 128}, num_warps=4, num_stages=2),
-#         triton.Config({'BV': 128}, num_warps=8, num_stages=2),
-#         triton.Config({'BV': 128}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=4, num_stages=2),
+#         triton.Config({}, num_warps=8, num_stages=2),
+#         triton.Config({}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=8, num_stages=3),
 #     ],
 #     # Separate autotune decisions by value dim, group size, and bottom-vs-non-bottom.
 #     key=['V', 'NUM_GROUPS', 'layer_idx'],
@@ -786,7 +771,7 @@ def htree_accumulate_non_topk_kernel(
     layer_v,  # [B, N_layer, H_kv, V]
     prev_selected_parents,  # [B, T, H_kv, TOP_K]
     # Kernel 2.1 的输出
-    all_scores,  # [B, T, H, MAX_CANDIDATES]
+    all_scores,  # [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
     num_candidates,  # [B, T, H_kv]
     # 输出
     layer_max,  # [B, T, H]
@@ -840,12 +825,14 @@ def htree_accumulate_non_topk_kernel(
     n_cand = tl.load(num_candidates + num_cand_offset).to(tl.int32)
 
     # Head ids in this GQA group (query-head granularity)
-    head_ids = (i_h_kv * NUM_GROUPS + tl.arange(0, NUM_GROUPS)).to(tl.int64)  # [G]
+    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)  # [G]
+    head_ids = (i_h_kv * NUM_GROUPS + g_ids).to(tl.int64)  # [G]
 
-    # Base for all_scores: [B, T, H, MAX_CANDIDATES]
-    scores_bt_base = (
-        i_b.to(tl.int64) * T_i64 * H * MAX_CANDIDATES
-        + i_t.to(tl.int64) * H * MAX_CANDIDATES
+    # Base for all_scores: [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS]
+    scores_base = (
+        (i_b.to(tl.int64) * T_i64 * H_kv + i_t.to(tl.int64) * H_kv + i_h_kv.to(tl.int64))
+        * MAX_CANDIDATES
+        * NUM_GROUPS
     )
 
     # V-slice for this program
@@ -917,31 +904,30 @@ def htree_accumulate_non_topk_kernel(
             global_pos = global_pos_base.to(tl.int32) + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
             child_candidate_mask = valid_parent & child_valid_mask & (global_pos < n_cand)  # [CR]
 
-            # Load scores for all G query heads: [G, CR]
-            pos_i64 = global_pos.to(tl.int64)
-            head_off = head_ids[:, None] * MAX_CANDIDATES + pos_i64[None, :]
-            s_ptrs = all_scores + scores_bt_base + head_off
+            # Load scores for all G query heads from the re-laid out buffer: [CR, G]
+            pos_i64 = global_pos.to(tl.int64)  # [CR]
+            s_ptrs = all_scores + scores_base + pos_i64[:, None] * NUM_GROUPS + g_ids[None, :]
             scores = tl.load(
                 s_ptrs,
-                mask=child_candidate_mask[None, :],
+                mask=child_candidate_mask[:, None],
                 other=-1e10,
-            ).to(tl.float32)
+            ).to(tl.float32)  # [CR, G]
 
             if not is_bottom_layer:
                 score_valid = scores > SCORE_VALID_THRESHOLD
-                final_mask = child_candidate_mask[None, :] & score_valid
+                final_mask = child_candidate_mask[:, None] & score_valid
             else:
-                final_mask = child_candidate_mask[None, :]
+                final_mask = child_candidate_mask[:, None]
 
             masked_scores = tl.where(final_mask, scores, -1e10)
-            parent_max = tl.max(masked_scores, axis=1)  # [G]
-            exp_scores = tl.exp(masked_scores - parent_max[:, None])
+            parent_max = tl.max(masked_scores, axis=0)  # [G]
+            exp_scores = tl.exp(masked_scores - parent_max[None, :])
             exp_scores = tl.where(final_mask, exp_scores, 0.0)
-            parent_sum = tl.sum(exp_scores, axis=1)  # [G]
+            parent_sum = tl.sum(exp_scores, axis=0)  # [G]
 
             # Weighted sum over children for this V slice.
             # Use explicit reduction instead of tl.dot: G is small (4/8) and tl.dot requires M>=16.
-            parent_out = tl.sum(exp_scores[:, :, None] * v_vals[None, :, :], axis=1)  # [G, BV]
+            parent_out = tl.sum(exp_scores[:, :, None] * v_vals[:, None, :], axis=0)  # [G, BV]
 
             # Online softmax merge (vectorized over G).
             has_contribution = parent_sum > 0
@@ -1271,6 +1257,7 @@ def htree_forward_v2(
     
     # 验证 GQA 配置
     assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"
+    NUM_GROUPS = H // H_kv
     assert k.shape[2] == v.shape[2], f"K and V must have same number of heads"
     assert (top_k_per_layer & (top_k_per_layer - 1)) == 0, "top_k_per_layer (TOP_K) must be a power of 2"
 
@@ -1300,7 +1287,7 @@ def htree_forward_v2(
         temp_len = (temp_len + compression_rate - 1) // compression_rate
         num_layers += 1
     
-    print(f"  Tree has {num_layers} layers (H={H}, H_kv={H_kv}, num_groups={H // H_kv})")
+    print(f"  Tree has {num_layers} layers (H={H}, H_kv={H_kv}, num_groups={NUM_GROUPS})")
     
     layers_k = [k]
     layers_v = [v]
@@ -1374,7 +1361,9 @@ def htree_forward_v2(
 
     # per-layer reusable workspaces (aligned with parallel.py)
     MAX_CANDIDATES = 8192
-    all_scores = torch.empty([B, T, H, MAX_CANDIDATES], dtype=torch.float32, device=device)
+    # Re-laid out to make GQA-group dimension contiguous for score reads:
+    # all_scores[b, t, h_kv, pos, g] where g in [0, NUM_GROUPS).
+    all_scores = torch.empty([B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS], dtype=torch.float32, device=device)
     num_candidates = torch.empty([B, T, H_kv], dtype=torch.int32, device=device)
     topk_positions = torch.empty([B, T, H_kv, top_k_per_layer], dtype=torch.int32, device=device)
     
@@ -1414,7 +1403,9 @@ def htree_forward_v2(
         end_k21 = torch.cuda.Event(enable_timing=True)
         start_k21.record()
         
-        htree_compute_scores_kernel[grid](
+        # Kernel 2.1a is KV-granularity: one program per (b, t, h_kv), computing NUM_GROUPS heads.
+        grid_kv = (T, B * H_kv)
+        htree_compute_scores_kernel[grid_kv](
             q, k_layer,
             prev_selected_parents,
             cos_cache, sin_cache,
@@ -1422,7 +1413,7 @@ def htree_forward_v2(
             layer_idx=layer_idx,
             layer_power=layer_power,
             B=B, T=T, H=H, H_kv=H_kv,
-            NUM_GROUPS=H // H_kv,
+            NUM_GROUPS=NUM_GROUPS,
             K=K, V=V, N_layer=N_layer,
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
@@ -1452,7 +1443,7 @@ def htree_forward_v2(
                 topk_positions,
                 layer_idx=layer_idx,
                 B=B, T=T, H=H, H_kv=H_kv,
-                NUM_GROUPS=H // H_kv,
+                NUM_GROUPS=NUM_GROUPS,
                 TOP_K=top_k_per_layer,
                 MAX_CANDIDATES=MAX_CANDIDATES,
                 COMPRESSION_RATE=compression_rate,
@@ -1478,7 +1469,7 @@ def htree_forward_v2(
             htree_mask_topk_scores_kernel[grid_kv](
                 all_scores,
                 topk_positions,
-                B=B, T=T, H=H, H_kv=H_kv, NUM_GROUPS=H // H_kv,
+                B=B, T=T, H=H, H_kv=H_kv, NUM_GROUPS=NUM_GROUPS,
                 TOP_K=top_k_per_layer,
                 MAX_CANDIDATES=MAX_CANDIDATES,
                 NEG_INF=HTREE_SCORE_NEG_INF,
@@ -1511,7 +1502,7 @@ def htree_forward_v2(
             layer_idx=layer_idx,
             layer_power=layer_power,
             B=B, T=T, H=H, H_kv=H_kv,
-            NUM_GROUPS=H // H_kv,
+            NUM_GROUPS=NUM_GROUPS,
             V=V, BV=BV, N_layer=N_layer,
             COMPRESSION_RATE=compression_rate,
             TOP_K=top_k_per_layer,
