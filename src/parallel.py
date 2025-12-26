@@ -919,28 +919,26 @@ def htree_accumulate_non_topk_kernel(
             else:
                 final_mask = child_candidate_mask[:, None]
 
-            masked_scores = tl.where(final_mask, scores, -1e10)
-            parent_max = tl.max(masked_scores, axis=0)  # [G]
-            exp_scores = tl.exp(masked_scores - parent_max[None, :])
-            exp_scores = tl.where(final_mask, exp_scores, 0.0)
-            parent_sum = tl.sum(exp_scores, axis=0)  # [G]
+            # block_max over CR children (per query head in the group)
+            masked_for_max = tl.where(final_mask, scores, -1e10)
+            batch_max = tl.max(masked_for_max, axis=0)  # [G]
 
-            # Weighted sum over children for this V slice.
-            # Use explicit reduction instead of tl.dot: G is small (4/8) and tl.dot requires M>=16.
-            parent_out = tl.sum(exp_scores[:, :, None] * v_vals[:, None, :], axis=0)  # [G, BV]
+            new_max = tl.maximum(cur_max, batch_max)  # [G]
+            scale = tl.exp(cur_max - new_max)         # [G]
 
-            # Online softmax merge (vectorized over G).
-            has_contribution = parent_sum > 0
-            new_max = tl.maximum(cur_max, parent_max)
-            scale_cur = tl.where(cur_sum > 0, tl.exp(cur_max - new_max), 0.0)
-            scale_parent = tl.exp(parent_max - new_max)
+            # rescale historical accumulation to the new reference max
+            cur_sum = cur_sum * scale
+            cur_output = cur_output * scale[:, None]
 
-            merged_sum = cur_sum * scale_cur + parent_sum * scale_parent
-            merged_out = cur_output * scale_cur[:, None] + parent_out * scale_parent[:, None]
+            # p = exp(scores - new_max) (masked), accumulate directly
+            scores_for_exp = tl.where(final_mask, scores, -1e10)
+            p = tl.exp(scores_for_exp - new_max[None, :])  # [CR, G], invalid -> 0
+            p = tl.where(final_mask, p, 0.0) # avoid exp(0)=1
+            dp = tl.sum(p[:, :, None] * v_vals[:, None, :], axis=0)  # [G, BV]
 
-            cur_max = tl.where(has_contribution, new_max, cur_max)
-            cur_sum = tl.where(has_contribution, merged_sum, cur_sum)
-            cur_output = tl.where(has_contribution[:, None], merged_out, cur_output)
+            cur_sum = cur_sum + tl.sum(p, axis=0)
+            cur_output = cur_output + dp
+            cur_max = new_max
 
     # ========================================
     # 阶段 3: 存储结果
