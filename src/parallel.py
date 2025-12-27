@@ -233,15 +233,14 @@ def load_k_with_rope_v2(
 
 # @triton.autotune(
 #     configs=[
-#         triton.Config({}, num_warps=2, num_stages=2),
-#         triton.Config({}, num_warps=4, num_stages=2),
 #         triton.Config({}, num_warps=4, num_stages=3),
-#         triton.Config({}, num_warps=8, num_stages=2),
 #         triton.Config({}, num_warps=8, num_stages=3),
+#         triton.Config({}, num_warps=4, num_stages=4),
+#         triton.Config({}, num_warps=8, num_stages=4),
+#         triton.Config({}, num_warps=4, num_stages=5),
+#         triton.Config({}, num_warps=8, num_stages=5),
 #     ],
-#     # Key by head grouping + rope/compression structure + bottom-vs-non-bottom.
-#     # Avoid keying on T to prevent excessive cache fragmentation.
-#     key=['K', 'NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K', 'layer_idx'],
+#     key=['K', 'NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K'], 
 # )
 @triton.jit
 def htree_compute_scores_kernel(
@@ -452,14 +451,12 @@ def htree_compute_scores_kernel(
 
 # @triton.autotune(
 #     configs=[
-#         triton.Config({}, num_warps=2, num_stages=1),
-#         triton.Config({}, num_warps=2, num_stages=2),
-#         triton.Config({}, num_warps=4, num_stages=1),
 #         triton.Config({}, num_warps=4, num_stages=2),
-#         triton.Config({}, num_warps=8, num_stages=1),
 #         triton.Config({}, num_warps=8, num_stages=2),
+#         triton.Config({}, num_warps=4, num_stages=3),
+#         triton.Config({}, num_warps=8, num_stages=3),
 #     ],
-#     key=['NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K', 'layer_idx'],
+#     key=['NUM_GROUPS', 'COMPRESSION_RATE', 'TOP_K'],
 # )
 @triton.jit
 def htree_select_topk_shared_gqa_kernel(
@@ -758,13 +755,13 @@ def htree_mask_topk_scores_kernel(
 
 # @triton.autotune(
 #     configs=[
-#         triton.Config({}, num_warps=4, num_stages=2),
-#         triton.Config({}, num_warps=8, num_stages=2),
 #         triton.Config({}, num_warps=4, num_stages=3),
 #         triton.Config({}, num_warps=8, num_stages=3),
+#         triton.Config({}, num_warps=4, num_stages=4),
+#         triton.Config({}, num_warps=8, num_stages=4),
+#         triton.Config({}, num_warps=8, num_stages=5),
 #     ],
-#     # Separate autotune decisions by value dim, group size, and bottom-vs-non-bottom.
-#     key=['V', 'NUM_GROUPS', 'layer_idx'],
+#     key=['V', 'NUM_GROUPS', 'COMPRESSION_RATE'],
 # )
 @triton.jit
 def htree_accumulate_non_topk_kernel(
