@@ -694,8 +694,7 @@ def htree_compute_next_parents_kernel(
     selected_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
 
     n_dims_topk: tl.constexpr = 9  # log2(512); TOP_K must be power-of-2 and currently assumed 512
-    dummy = tl.arange(0, TOP_K).to(tl.int32)
-    selected_sorted, _ = argsort_v2(selected_sorted, dummy, n_dims_topk, 1, descending=False)
+    selected_sorted = sort_single(selected_sorted, n_dims_topk, 1, descending=False)
     selected_sorted = tl.where(selected_sorted < MAX_IDX, selected_sorted, -1)
 
     tl.store(next_selected_parents + base + o_topk, selected_sorted.to(tl.int32))
