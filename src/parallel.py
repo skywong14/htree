@@ -13,7 +13,7 @@ Pipeline
   Phase 2: Init Global State & Workspaces
     - 初始化全局 online-softmax 状态: `global_max/global_sum/global_output`
     - 分配每层复用的 workspace: 
-      · `all_scores`: [B, T, H, MAX_CANDIDATES(=8192)] —— 候选 buffer (仅存 score)
+      · `all_scores`: [B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS] —— 候选 buffer (仅存 score)
       · `num_candidates`: [B, T, H_kv] —— KV head 粒度共享的候选数量 n_cand
       · `prev_selected_parents`: [B, T, H_kv, TOP_K] —— 下一层展开所需的 parent 列表 (升序)
 
@@ -21,7 +21,7 @@ Pipeline
     - Kernel 2.1a `htree_compute_scores_kernel` (scores only)
       · 对每个 (b,t,h) 计算其候选集合的 score, 写入 `all_scores[b,t,h,0:n_cand]`
       · 候选集合由 `prev_selected_parents[b,t,h_kv,:]` 给出 (KV head 粒度共享)
-      · 采用固定 tile: 每批 32 parents * COMPRESSION_RATE(通常 16) children = 512
+      · 采用固定 tile: 每批 32 parents * COMPRESSION_RATE children = BC (例如 COMPRESSION_RATE=16 时 BC=512)
 
     - Kernel 2.1b `htree_select_topk_shared_gqa_kernel` (non-bottom layers only)
       · 对每个 (b,t,h_kv) 在同组 NUM_GROUPS 个 query heads 上做 NSA-style 聚合: 
@@ -50,6 +50,7 @@ Pipeline
 """
 
 from typing import Optional
+import math
 import torch
 import torch.cuda.nvtx as nvtx
 import triton
@@ -358,9 +359,10 @@ def htree_compute_scores_kernel(
     for i_batch in range(num_batches):
         # 加载 32 个父节点索引
         o_parent_local = tl.arange(0, PARENTS_PER_BATCH)
+        idx_in_topk = (i_batch * PARENTS_PER_BATCH + o_parent_local).to(tl.int32)
         parent_indices = tl.load(
             prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + o_parent_local,
-            mask=o_parent_local < PARENTS_PER_BATCH,
+            mask=idx_in_topk < TOP_K,
             other=-1
         )  # [32]
         
@@ -394,7 +396,12 @@ def htree_compute_scores_kernel(
         
         # 遍历 32 个父节点
         for i_p in tl.static_range(PARENTS_PER_BATCH):
-            parent_idx = tl.load(prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p)
+            parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
+            parent_idx = tl.load(
+                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
+                mask=parent_off < TOP_K,
+                other=-1,
+            )
             
             if parent_idx >= 0:
                 child_start = parent_idx * COMPRESSION_RATE
@@ -473,6 +480,8 @@ def htree_select_topk_shared_gqa_kernel(
     MAX_CANDIDATES: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     SCORE_VALID_THRESHOLD: tl.constexpr,
+    LOG_N: tl.constexpr,
+    N_DIMS_BATCH: tl.constexpr,
 ):
     """Kernel 2.1b: NSA-style shared Top-K selection per KV head.
 
@@ -523,7 +532,7 @@ def htree_select_topk_shared_gqa_kernel(
         tl.store(topk_positions + base_out + o_topk, tl.full([TOP_K], -1, dtype=tl.int32))
         return
 
-    # This implementation assumes a fixed per-batch candidate tile of 32*COMPRESSION_RATE (512 when rate=16).
+    # This implementation assumes a fixed per-batch candidate tile of 32*COMPRESSION_RATE (BC).
     PARENTS_PER_BATCH: tl.constexpr = 32
     BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
 
@@ -567,7 +576,7 @@ def htree_select_topk_shared_gqa_kernel(
     # ------------------------------------------------
     running_topk_encoded = tl.full([BC], float('-inf'), dtype=tl.float32)
 
-    LOG_N: tl.constexpr = 13  # log2(8192)
+    # LOG_N = log2(MAX_CANDIDATES) for bit-packing the buffer position.
     idx_mask = (1 << LOG_N) - 1
 
     rightmost_pos = (n_cand - 1).to(tl.int32)
@@ -595,9 +604,8 @@ def htree_select_topk_shared_gqa_kernel(
         encoded_int = (imp_int & ~idx_mask) | encoded_idx
         imp_encoded = encoded_int.to(tl.float32, bitcast=True)
 
-        # Sort per-batch (512) then merge into running topk (512) via sort on 1024
-        n_dims_batch: tl.constexpr = 9  # log2(512)
-        sorted_batch = sort_single(imp_encoded, n_dims_batch, 1, descending=True)
+        # Sort per-batch (BC) then merge into running topk (BC) via sort on (2*BC).
+        sorted_batch = sort_single(imp_encoded, N_DIMS_BATCH, 1, descending=True)
 
         if i_batch == 0:
             running_topk_encoded = sorted_batch
@@ -608,8 +616,8 @@ def htree_select_topk_shared_gqa_kernel(
             merged_2d = tl.where(row_idx == 0, running_b, batch_b)
             merged_input = tl.reshape(merged_2d, [2 * BC])
 
-            n_dims_merge: tl.constexpr = 10  # log2(1024)
-            sorted_merged = sort_single(merged_input, n_dims_merge, 1, descending=True)
+            N_DIMS_MERGE: tl.constexpr = N_DIMS_BATCH + 1  # log2(2*BC)
+            sorted_merged = sort_single(merged_input, N_DIMS_MERGE, 1, descending=True)
             reshaped_merged = tl.reshape(sorted_merged, [2, BC])
             mask_row0 = (tl.arange(0, 2)[:, None] == 0)
             running_topk_encoded = tl.sum(tl.where(mask_row0, reshaped_merged, 0.0), axis=0)
@@ -630,8 +638,10 @@ def htree_select_topk_shared_gqa_kernel(
         + i_t.to(tl.int64) * H_kv * TOP_K
         + i_h_kv.to(tl.int64) * TOP_K
     )
-    o_topk = tl.arange(0, TOP_K)
-    tl.store(topk_positions + base_out + o_topk, topk_buf_pos.to(tl.int32))
+    # running_topk_encoded/topk_buf_pos are length BC; only write the first TOP_K entries.
+    o_out = tl.arange(0, BC)
+    out_ptrs = topk_positions + base_out + o_out.to(tl.int64)
+    tl.store(out_ptrs, topk_buf_pos.to(tl.int32), mask=o_out < TOP_K)
 
 
 # ==========================================
@@ -648,6 +658,7 @@ def htree_compute_next_parents_kernel(
     H_kv: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
+    N_DIMS_TOPK: tl.constexpr,
 ):
     """Compute next layer's prev_selected_parents (KV head granularity) from (prev_selected_parents, topk_positions).
 
@@ -678,9 +689,11 @@ def htree_compute_next_parents_kernel(
     parent_slot = (within_batch // COMPRESSION_RATE).to(tl.int64)
     child_slot = (within_batch - parent_slot * COMPRESSION_RATE).to(tl.int64)
 
+    idx_in_topk = batch_id * PARENTS_PER_BATCH + parent_slot
+    idx_in_topk_valid = idx_in_topk < TOP_K
     parent_idx = tl.load(
-        prev_selected_parents + base + batch_id * PARENTS_PER_BATCH + parent_slot,
-        mask=gather_mask,
+        prev_selected_parents + base + idx_in_topk,
+        mask=gather_mask & idx_in_topk_valid,
         other=-1,
     )
     selected_node_indices = tl.where(
@@ -693,8 +706,8 @@ def htree_compute_next_parents_kernel(
     MAX_IDX: tl.constexpr = 2147483647
     selected_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
 
-    n_dims_topk: tl.constexpr = 9  # log2(512); TOP_K must be power-of-2 and currently assumed 512
-    selected_sorted = sort_single(selected_sorted, n_dims_topk, 1, descending=False)
+    # TOP_K must be power-of-2; N_DIMS_TOPK = log2(TOP_K).
+    selected_sorted = sort_single(selected_sorted, N_DIMS_TOPK, 1, descending=False)
     selected_sorted = tl.where(selected_sorted < MAX_IDX, selected_sorted, -1)
 
     tl.store(next_selected_parents + base + o_topk, selected_sorted.to(tl.int32))
@@ -860,8 +873,11 @@ def htree_accumulate_non_topk_kernel(
     for i_batch in range(num_batches):
         # Iterate over 32 parents in this batch (fixed tile).
         for i_p in tl.static_range(PARENTS_PER_BATCH):
+            parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
             parent_idx = tl.load(
-                prev_selected_parents + prev_sel_base + i_batch * PARENTS_PER_BATCH + i_p
+                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
+                mask=parent_off < TOP_K,
+                other=-1,
             ).to(tl.int32)
 
             valid_parent = parent_idx >= 0
@@ -1255,6 +1271,16 @@ def htree_forward_v2(
     assert k.shape[2] == v.shape[2], f"K and V must have same number of heads"
     assert (top_k_per_layer & (top_k_per_layer - 1)) == 0, "top_k_per_layer (TOP_K) must be a power of 2"
 
+    # Parameter regime constraints for this Triton implementation.
+    # - Candidate buffer assumes MAX_CANDIDATES == TOP_K * COMPRESSION_RATE.
+    # - Bitonic sorts assume power-of-2 sizes (TOP_K and BC=32*COMPRESSION_RATE).
+    assert max_top_nodes == top_k_per_layer * compression_rate, (
+        f"max_top_nodes ({max_top_nodes}) must equal top_k_per_layer*compression_rate "
+        f"({top_k_per_layer}*{compression_rate}={top_k_per_layer * compression_rate})"
+    )
+    assert (compression_rate & (compression_rate - 1)) == 0, "compression_rate must be a power of 2"
+    assert (max_top_nodes & (max_top_nodes - 1)) == 0, "max_top_nodes must be a power of 2"
+
     # This implementation uses a fixed per-batch candidate tile of 32*compression_rate.
     # top_k_per_layer controls how many nodes are expanded to the next layer.
     assert top_k_per_layer <= 32 * compression_rate, (
@@ -1353,13 +1379,21 @@ def htree_forward_v2(
     layer_sum = torch.empty([B, T, H], dtype=torch.float32, device=device)
     layer_output = torch.empty([B, T, H, V], dtype=torch.float32, device=device)
 
-    # per-layer reusable workspaces (aligned with parallel.py)
-    MAX_CANDIDATES = 8192
+    # per-layer reusable workspaces
+    # MAX_CANDIDATES is the physical buffer length for storing per-(b,t,h_kv) candidate scores.
+    MAX_CANDIDATES = max_top_nodes
     # Re-laid out to make GQA-group dimension contiguous for score reads:
     # all_scores[b, t, h_kv, pos, g] where g in [0, NUM_GROUPS).
     all_scores = torch.empty([B, T, H_kv, MAX_CANDIDATES, NUM_GROUPS], dtype=torch.float32, device=device)
     num_candidates = torch.empty([B, T, H_kv], dtype=torch.int32, device=device)
     topk_positions = torch.empty([B, T, H_kv, top_k_per_layer], dtype=torch.int32, device=device)
+
+    # constexprs for kernels that use bitonic sort / bit-packing
+    PARENTS_PER_BATCH = 32
+    BC = PARENTS_PER_BATCH * compression_rate  # must be power-of-2
+    LOG_N = int(math.log2(MAX_CANDIDATES))
+    N_DIMS_BATCH = int(math.log2(BC))
+    N_DIMS_TOPK = int(math.log2(top_k_per_layer))
     
      # 为最顶层初始化 prev_selected_parents
     top_layer_power = compression_rate ** (num_layers - 1)
@@ -1442,6 +1476,8 @@ def htree_forward_v2(
                 MAX_CANDIDATES=MAX_CANDIDATES,
                 COMPRESSION_RATE=compression_rate,
                 SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
+                LOG_N=LOG_N,
+                N_DIMS_BATCH=N_DIMS_BATCH,
             )
             end_k21b.record()
             torch.cuda.synchronize()
@@ -1549,6 +1585,7 @@ def htree_forward_v2(
                 B=B, T=T, H_kv=H_kv,
                 COMPRESSION_RATE=compression_rate,
                 TOP_K=top_k_per_layer,
+                N_DIMS_TOPK=N_DIMS_TOPK,
             )
 
             end_k24.record()
