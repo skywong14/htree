@@ -829,3 +829,357 @@ def forward_kernel(
 
     nvtx.range_pop()  # Naive_Forward
     return output
+
+
+# ============================================================================
+# Backward (reference): recompute a differentiable forward and call autograd.grad
+# ============================================================================
+
+def _online_softmax_merge_group(
+    max_score: torch.Tensor,        # [G]
+    sum_exp: torch.Tensor,          # [G]
+    weighted_out: torch.Tensor,     # [G, D]
+    new_scores: torch.Tensor,       # [G, N]
+    new_values: torch.Tensor,       # [N, D] (shared across G; KV head shared)
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Vectorized online-softmax merge across a GQA group (differentiable)."""
+    if new_scores.numel() == 0:
+        return max_score, sum_exp, weighted_out
+
+    # [G]
+    new_max = new_scores.max(dim=1).values
+    updated_max = torch.maximum(max_score, new_max)
+
+    # Rescale old accumulation to the new reference max (exact online softmax).
+    scale_old = torch.exp(max_score - updated_max)  # [G]
+    sum_exp = sum_exp * scale_old
+    weighted_out = weighted_out * scale_old[:, None]
+
+    # Add new contributions.
+    exp_new = torch.exp(new_scores - updated_max[:, None])  # [G, N]
+    sum_exp = sum_exp + exp_new.sum(dim=1)
+    weighted_out = weighted_out + (exp_new @ new_values.to(exp_new.dtype))
+
+    return updated_max, sum_exp, weighted_out
+
+
+def _compute_candidates_mask(
+    node_ranges: torch.Tensor,
+    query_pos: int,
+    prev_selected_parents: Optional[torch.Tensor],
+    compression_rate: int,
+    layer_idx: int,
+    *,
+    device: torch.device,
+) -> Tuple[torch.Tensor, int]:
+    """Return (candidates_mask [N] bool, rightmost_idx). Pure indexing logic."""
+    N = node_ranges.shape[0]
+    if prev_selected_parents is None:
+        candidates_mask = node_ranges[:, 0] <= query_pos
+    else:
+        parents = prev_selected_parents.reshape(-1)
+        parents = parents[parents >= 0]
+        if parents.numel() == 0:
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+        else:
+            child_offsets = torch.arange(compression_rate, device=device)
+            children = (parents[:, None] * compression_rate + child_offsets).reshape(-1)
+            children = children[children < N]
+            valid_mask = node_ranges[:, 0] <= query_pos
+            valid_children = children[valid_mask[children]]
+            candidates_mask = torch.zeros(N, dtype=torch.bool, device=device)
+            candidates_mask[valid_children] = True
+
+    rightmost_idx = query_pos // (compression_rate ** layer_idx)
+    if rightmost_idx < N:
+        candidates_mask[rightmost_idx] = True
+
+    return candidates_mask, rightmost_idx
+
+
+def _htree_loss_gqa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    query_positions: Optional[torch.Tensor],
+    compression_rate: int,
+    max_top_nodes: int,
+    top_k_per_layer: int,
+    scale: Optional[float],
+) -> torch.Tensor:
+    """Compute scalar loss = sum(out * grad_out) for the requested positions (differentiable)."""
+    B, T, H, D = q.shape
+    H_kv = k.shape[2]
+    assert H % H_kv == 0
+    G = H // H_kv
+    if scale is None:
+        scale = D ** -0.5
+
+    device = q.device
+    rotary = Rotary(dim=D).to(device)
+
+    # Build tree (differentiable w.r.t k/v)
+    layers = build_tree(k, v, compression_rate, max_top_nodes)
+    num_layers = len(layers)
+
+    # Normalize grad_out dtype for stable accumulation.
+    grad_out_f = grad_out.to(torch.float32)
+
+    loss = q.new_zeros((), dtype=torch.float32)
+    for b in range(B):
+        if query_positions is None:
+            positions_to_compute = range(T)
+        else:
+            positions_to_compute = [int(p) for p in query_positions[b].tolist() if p >= 0]
+
+        for kv_h in range(H_kv):
+            h0 = kv_h * G
+            h1 = (kv_h + 1) * G
+            for t in positions_to_compute:
+                query_group = q[b, t, h0:h1].to(torch.float32)  # [G, D]
+
+                max_score_g = torch.full([G], -float('inf'), device=device, dtype=torch.float32)
+                sum_exp_g = torch.zeros([G], device=device, dtype=torch.float32)
+                weighted_out_g = torch.zeros([G, D], device=device, dtype=torch.float32)
+                prev_selected = None  # [TOP_K] int32 or None
+
+                for layer_idx in range(num_layers - 1, -1, -1):
+                    layer_k, layer_v, node_ranges = layers[layer_idx]
+                    layer_k_head = layer_k[b, :, kv_h]  # [N, D]
+                    layer_v_head = layer_v[b, :, kv_h]  # [N, D]
+
+                    candidates_mask, rightmost_idx = _compute_candidates_mask(
+                        node_ranges,
+                        t,
+                        prev_selected,
+                        compression_rate,
+                        layer_idx,
+                        device=device,
+                    )
+                    candidate_indices = torch.where(candidates_mask)[0]
+                    candidate_indices = torch.sort(candidate_indices)[0]
+                    num_cand = int(candidate_indices.numel())
+                    if num_cand == 0:
+                        raise RuntimeError(f"No candidates at layer {layer_idx}, t={t}")
+
+                    cand_k = layer_k_head[candidate_indices].to(torch.float32)  # [N, D]
+                    cand_v = layer_v_head[candidate_indices].to(torch.float32)  # [N, D]
+
+                    # RoPE positions are local to the candidate list (0..num_cand-1); query uses num_cand-1.
+                    pos = torch.arange(num_cand, device=device)
+                    cos, sin = rotary.forward(pos, device)
+                    cand_k_rope = apply_rotary_emb(cand_k, cos, sin)  # [N, D]
+                    q_rope = apply_rotary_emb(query_group, cos[num_cand - 1], sin[num_cand - 1])  # [G, D]
+
+                    # Scores: [G, N]
+                    scores = (q_rope * float(scale)) @ cand_k_rope.transpose(0, 1)
+
+                    is_bottom = (layer_idx == 0)
+                    if is_bottom:
+                        max_score_g, sum_exp_g, weighted_out_g = _online_softmax_merge_group(
+                            max_score_g, sum_exp_g, weighted_out_g, scores, cand_v
+                        )
+                        prev_selected = None
+                    else:
+                        # NSA-style shared importance across the group.
+                        lse = torch.logsumexp(scores, dim=1)  # [G]
+                        p = torch.exp(scores - lse[:, None]).to(torch.float32)  # [G, N]
+                        p = torch.where(
+                            p < torch.finfo(torch.float32).tiny,
+                            torch.zeros_like(p),
+                            p,
+                        )
+                        imp = p.sum(dim=0)  # [N]
+
+                        # Stable Top-K selection is discrete: detach it from autograd.
+                        with torch.no_grad():
+                            loc = torch.where(candidate_indices == rightmost_idx)[0]
+                            force_pos = int(loc[-1].item()) if loc.numel() > 0 else (num_cand - 1)
+                            topk_pos = stable_topk_positions_with_bitpacking(
+                                imp.detach(),
+                                top_k_per_layer,
+                                force_select_pos=force_pos,
+                                log_n=13,
+                            )
+                            valid_pos = topk_pos[topk_pos >= 0].to(torch.long)
+                            selected_mask = torch.zeros(num_cand, dtype=torch.bool, device=device)
+                            if valid_pos.numel() > 0:
+                                selected_mask[valid_pos] = True
+
+                            selected_nodes = candidate_indices[valid_pos]
+                            selected_nodes_sorted, _ = torch.sort(selected_nodes)
+                            prev_selected = torch.full(
+                                [top_k_per_layer], -1, dtype=torch.int32, device=device
+                            )
+                            take = min(top_k_per_layer, int(selected_nodes_sorted.numel()))
+                            if take > 0:
+                                prev_selected[:take] = selected_nodes_sorted[:take].to(torch.int32)
+
+                        merge_mask = ~selected_mask
+                        if bool(merge_mask.any()):
+                            merge_scores = scores[:, merge_mask]  # [G, N_merge]
+                            merge_values = cand_v[merge_mask]     # [N_merge, D]
+                            max_score_g, sum_exp_g, weighted_out_g = _online_softmax_merge_group(
+                                max_score_g, sum_exp_g, weighted_out_g, merge_scores, merge_values
+                            )
+
+                out_group = weighted_out_g / sum_exp_g.clamp_min(1e-30)[:, None]  # [G, D]
+                loss = loss + (out_group * grad_out_f[b, t, h0:h1]).sum()
+
+    return loss
+
+
+def backward_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    *,
+    query_positions: Optional[torch.Tensor] = None,
+    compression_rate: int = 16,
+    max_top_nodes: int = 8192,
+    top_k_per_layer: int = 512,
+    scale: Optional[float] = None,
+    chunk_size: int = 8,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reference backward for naive GQA.
+
+    Notes:
+    - Discrete Top-K selection is treated as constant (no gradient through selection).
+    - Uses recomputation + `torch.autograd.grad` for correctness.
+    - `chunk_size` trades runtime for peak memory (rebuilds the tree each chunk).
+    """
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    assert grad_out.shape == q.shape
+    B, T, H, D = q.shape
+    assert k.shape[0] == B and k.shape[1] == T and v.shape[0] == B and v.shape[1] == T
+
+    # Leaf tensors for autograd.
+    q_leaf = q.detach().requires_grad_(True)
+    k_leaf = k.detach().requires_grad_(True)
+    v_leaf = v.detach().requires_grad_(True)
+
+    dq = torch.zeros_like(q_leaf)
+    dk = torch.zeros_like(k_leaf)
+    dv = torch.zeros_like(v_leaf)
+
+    # Split query positions into chunks to keep peak memory bounded.
+    if query_positions is None:
+        positions_per_b = [list(range(T)) for _ in range(B)]
+    else:
+        positions_per_b = [[int(p) for p in query_positions[b].tolist() if p >= 0] for b in range(B)]
+
+    with torch.enable_grad():
+        for b in range(B):
+            pos = positions_per_b[b]
+            for s in range(0, len(pos), max(1, int(chunk_size))):
+                chunk_list = pos[s:s + max(1, int(chunk_size))]
+                # Per-batch query_positions: only batch b is active; others are -1 (skipped).
+                qp_chunk = torch.full(
+                    [B, len(chunk_list)],
+                    -1,
+                    device=q.device,
+                    dtype=torch.int64,
+                )
+                if len(chunk_list) > 0:
+                    qp_chunk[b] = torch.tensor(chunk_list, device=q.device, dtype=torch.int64)
+
+                loss = _htree_loss_gqa(
+                    q_leaf,
+                    k_leaf,
+                    v_leaf,
+                    grad_out,
+                    query_positions=qp_chunk,
+                    compression_rate=compression_rate,
+                    max_top_nodes=max_top_nodes,
+                    top_k_per_layer=top_k_per_layer,
+                    scale=scale,
+                )
+
+                gq, gk, gv = torch.autograd.grad(
+                    loss,
+                    (q_leaf, k_leaf, v_leaf),
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+                dq = dq + gq
+                dk = dk + gk
+                dv = dv + gv
+
+    return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype)
+
+
+class HTreeNaiveGQAFn(torch.autograd.Function):
+    """Autograd wrapper: forward uses the existing reference forward; backward uses `backward_kernel`."""
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        query_positions: Optional[torch.Tensor] = None,
+        compression_rate: int = 16,
+        max_top_nodes: int = 8192,
+        top_k_per_layer: int = 512,
+        scale: Optional[float] = None,
+        chunk_size: int = 8,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(q, k, v, query_positions if query_positions is not None else torch.empty(0, device=q.device, dtype=torch.int64))
+        ctx.has_query_positions = query_positions is not None
+        ctx.compression_rate = compression_rate
+        ctx.max_top_nodes = max_top_nodes
+        ctx.top_k_per_layer = top_k_per_layer
+        ctx.scale = scale
+        ctx.chunk_size = chunk_size
+        with torch.no_grad():
+            return forward_kernel(
+                q,
+                k,
+                v,
+                query_positions=query_positions,
+                compression_rate=compression_rate,
+                max_top_nodes=max_top_nodes,
+                top_k_per_layer=top_k_per_layer,
+                scale=scale,
+            )
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):  # type: ignore[override]
+        q, k, v, qp = ctx.saved_tensors
+        query_positions = qp if ctx.has_query_positions else None
+        dq, dk, dv = backward_kernel(
+            q,
+            k,
+            v,
+            grad_out,
+            query_positions=query_positions,
+            compression_rate=ctx.compression_rate,
+            max_top_nodes=ctx.max_top_nodes,
+            top_k_per_layer=ctx.top_k_per_layer,
+            scale=ctx.scale,
+            chunk_size=ctx.chunk_size,
+        )
+        # match forward signature
+        return dq, dk, dv, None, None, None, None, None, None
+
+
+def forward_kernel_with_backward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    query_positions: Optional[torch.Tensor] = None,
+    compression_rate: int = 16,
+    max_top_nodes: int = 8192,
+    top_k_per_layer: int = 512,
+    scale: Optional[float] = None,
+    chunk_size: int = 8,
+) -> torch.Tensor:
+    """Drop-in forward that supports backward via a custom autograd Function."""
+    return HTreeNaiveGQAFn.apply(
+        q, k, v, query_positions, compression_rate, max_top_nodes, top_k_per_layer, scale, chunk_size
+    )
