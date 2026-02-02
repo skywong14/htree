@@ -91,81 +91,84 @@ def htree_build_kernel_v2(
 ):
     """
     Tree building kernel: mean pooling from child nodes to parent nodes
-    Grid: (B * H_kv,)
+    Grid: (N_parent_blocks, B * H_kv)
     """
-    i_bh = tl.program_id(0)
-    i_b = i_bh // H_kv
-    i_h = i_bh % H_kv
+    pid_seq = tl.program_id(0)
+    pid_bh = tl.program_id(1)
     
-    num_iterations = tl.cdiv(N_parent, BLOCK_SIZE)
+    i_b = pid_bh // H_kv
+    i_h = pid_bh % H_kv
     
-    for iter_idx in range(num_iterations):
-        parent_start = iter_idx * BLOCK_SIZE
-        child_start = parent_start * COMPRESSION_RATE
-        
-        # load K
-        k_base = child_k + i_b.to(tl.int64) * N_child * H_kv * K + i_h.to(tl.int64) * K
-        k_block_ptrs = tl.make_block_ptr(
-            base=k_base,
-            shape=(N_child, K),
-            strides=(H_kv * K, 1),
-            offsets=(child_start, 0),
-            block_shape=(BLOCK_SIZE * COMPRESSION_RATE, K),
-            order=(1, 0)
-        )
-        k_vals = tl.load(k_block_ptrs, boundary_check=(0, 1))
-        
-        # load V
-        v_base = child_v + i_b.to(tl.int64) * N_child * H_kv * V + i_h.to(tl.int64) * V
-        v_block_ptrs = tl.make_block_ptr(
-            base=v_base,
-            shape=(N_child, V),
-            strides=(H_kv * V, 1),
-            offsets=(child_start, 0),
-            block_shape=(BLOCK_SIZE * COMPRESSION_RATE, V),
-            order=(1, 0)
-        )
-        v_vals = tl.load(v_block_ptrs, boundary_check=(0, 1))
-        
-        # Reshape + Mean Pooling
-        parent_global_idx = parent_start + tl.arange(0, BLOCK_SIZE)
-        child_global_idx = parent_global_idx[:, None] * COMPRESSION_RATE + tl.arange(0, COMPRESSION_RATE)[None, :]
-        child_valid = (parent_global_idx[:, None] < N_parent) & (child_global_idx < N_child)
-        
-        k_vals_reshaped = tl.reshape(k_vals, [BLOCK_SIZE, COMPRESSION_RATE, K])
-        k_masked = tl.where(child_valid[:, :, None], k_vals_reshaped, 0.0)
-        k_sum = tl.sum(k_masked, axis=1)
-        num_valid_children = tl.sum(child_valid.to(tl.int32), axis=1)
-        num_valid_children_safe = tl.maximum(num_valid_children, 1)
-        k_mean = k_sum / num_valid_children_safe[:, None]
-        
-        v_vals_reshaped = tl.reshape(v_vals, [BLOCK_SIZE, COMPRESSION_RATE, V])
-        v_masked = tl.where(child_valid[:, :, None], v_vals_reshaped, 0.0)
-        v_sum = tl.sum(v_masked, axis=1)
-        v_mean = v_sum / num_valid_children_safe[:, None]
-        
-        # store
-        parent_k_base = parent_k + i_b.to(tl.int64) * N_parent * H_kv * K + i_h.to(tl.int64) * K
-        parent_k_block_ptrs = tl.make_block_ptr(
-            base=parent_k_base,
-            shape=(N_parent, K),
-            strides=(H_kv * K, 1),
-            offsets=(parent_start, 0),
-            block_shape=(BLOCK_SIZE, K),
-            order=(1, 0)
-        )
-        tl.store(parent_k_block_ptrs, k_mean.to(parent_k.dtype.element_ty), boundary_check=(0, 1))
-        
-        parent_v_base = parent_v + i_b.to(tl.int64) * N_parent * H_kv * V + i_h.to(tl.int64) * V
-        parent_v_block_ptrs = tl.make_block_ptr(
-            base=parent_v_base,
-            shape=(N_parent, V),
-            strides=(H_kv * V, 1),
-            offsets=(parent_start, 0),
-            block_shape=(BLOCK_SIZE, V),
-            order=(1, 0)
-        )
-        tl.store(parent_v_block_ptrs, v_mean.to(parent_v.dtype.element_ty), boundary_check=(0, 1))
+    parent_start = pid_seq * BLOCK_SIZE
+    # Early check, although grid should be tight
+    if parent_start >= N_parent:
+        return
+
+    child_start = parent_start * COMPRESSION_RATE
+    
+    # load K
+    k_base = child_k + i_b.to(tl.int64) * N_child * H_kv * K + i_h.to(tl.int64) * K
+    k_block_ptrs = tl.make_block_ptr(
+        base=k_base,
+        shape=(N_child, K),
+        strides=(H_kv * K, 1),
+        offsets=(child_start, 0),
+        block_shape=(BLOCK_SIZE * COMPRESSION_RATE, K),
+        order=(1, 0)
+    )
+    k_vals = tl.load(k_block_ptrs, boundary_check=(0, 1))
+    
+    # load V
+    v_base = child_v + i_b.to(tl.int64) * N_child * H_kv * V + i_h.to(tl.int64) * V
+    v_block_ptrs = tl.make_block_ptr(
+        base=v_base,
+        shape=(N_child, V),
+        strides=(H_kv * V, 1),
+        offsets=(child_start, 0),
+        block_shape=(BLOCK_SIZE * COMPRESSION_RATE, V),
+        order=(1, 0)
+    )
+    v_vals = tl.load(v_block_ptrs, boundary_check=(0, 1))
+    
+    # Reshape + Mean Pooling
+    parent_global_idx = parent_start + tl.arange(0, BLOCK_SIZE)
+    child_global_idx = parent_global_idx[:, None] * COMPRESSION_RATE + tl.arange(0, COMPRESSION_RATE)[None, :]
+    child_valid = (parent_global_idx[:, None] < N_parent) & (child_global_idx < N_child)
+    
+    k_vals_reshaped = tl.reshape(k_vals, [BLOCK_SIZE, COMPRESSION_RATE, K])
+    k_masked = tl.where(child_valid[:, :, None], k_vals_reshaped, 0.0)
+    k_sum = tl.sum(k_masked, axis=1)
+    num_valid_children = tl.sum(child_valid.to(tl.int32), axis=1)
+    num_valid_children_safe = tl.maximum(num_valid_children, 1)
+    k_mean = k_sum / num_valid_children_safe[:, None]
+    
+    v_vals_reshaped = tl.reshape(v_vals, [BLOCK_SIZE, COMPRESSION_RATE, V])
+    v_masked = tl.where(child_valid[:, :, None], v_vals_reshaped, 0.0)
+    v_sum = tl.sum(v_masked, axis=1)
+    v_mean = v_sum / num_valid_children_safe[:, None]
+    
+    # store
+    parent_k_base = parent_k + i_b.to(tl.int64) * N_parent * H_kv * K + i_h.to(tl.int64) * K
+    parent_k_block_ptrs = tl.make_block_ptr(
+        base=parent_k_base,
+        shape=(N_parent, K),
+        strides=(H_kv * K, 1),
+        offsets=(parent_start, 0),
+        block_shape=(BLOCK_SIZE, K),
+        order=(1, 0)
+    )
+    tl.store(parent_k_block_ptrs, k_mean.to(parent_k.dtype.element_ty), boundary_check=(0, 1))
+    
+    parent_v_base = parent_v + i_b.to(tl.int64) * N_parent * H_kv * V + i_h.to(tl.int64) * V
+    parent_v_block_ptrs = tl.make_block_ptr(
+        base=parent_v_base,
+        shape=(N_parent, V),
+        strides=(H_kv * V, 1),
+        offsets=(parent_start, 0),
+        block_shape=(BLOCK_SIZE, V),
+        order=(1, 0)
+    )
+    tl.store(parent_v_block_ptrs, v_mean.to(parent_v.dtype.element_ty), boundary_check=(0, 1))
 
 
 # ==========================================
@@ -1321,7 +1324,7 @@ def htree_forward_v2(
         next_v = torch.empty(B, next_len, H_kv, V, dtype=dtype, device=device)
         
         BLOCK_SIZE = 128
-        grid = (B * H_kv,)
+        grid = (triton.cdiv(next_len, BLOCK_SIZE), B * H_kv)
         
         torch.cuda.synchronize()
         start_build = torch.cuda.Event(enable_timing=True)
