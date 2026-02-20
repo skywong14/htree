@@ -603,7 +603,7 @@ def htree_fused_select_accumulate_gqa_kernel(
     idx_mask = (1 << LOG_N) - 1
     rightmost_pos = (n_cand - 1).to(tl.int32)
     # Running max for group-shared importance (scalar packed as shape [1]).
-    sel_m = tl.full([1], NEG_INF, dtype=tl.float32)
+    sel_m = tl.full([1], NEG_INF, dtype=tl.float32) # TODO may spill at exp(score - sel_m)
 
     # Initialize running Top-K with encoded NEG_INF (tie-broken by index)
     init_idx = tl.arange(0, TOP_K).to(tl.int32)
@@ -701,7 +701,7 @@ def htree_fused_select_accumulate_gqa_kernel(
 
         imp_flat = tl.where(imp_flat >= 0, imp_flat * rescale, imp_flat)
         # Keep rightmost causal position in Top-K deterministically.
-        imp_flat = tl.where(pos == rightmost_pos, 1e3, imp_flat)
+        imp_flat = tl.where(pos == rightmost_pos, 1e6, imp_flat)
         sel_m = sel_m_new
 
         # Bit-pack buffer position for stable sorting
