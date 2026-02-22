@@ -17,10 +17,13 @@ Pipeline
       · `next_selected_parents`: [B, T, H_kv, TOP_K] —— 当前层 shared Top-K 对应的 node indices (升序, -1 padding)
 
   Phase 3: Layer-by-layer Forward (top → bottom)
-    - Kernel 2.2 `htree_fused_select_accumulate_gqa_kernel`
+    - Kernel 2.2a `htree_bottom_accumulate_gqa_kernel`
+      · 底层：不做 Top-K，直接对全部候选做 online-softmax 累积
+      · 输出当前层的 `(layer_max, layer_sum, layer_output)`
+
+    - Kernel 2.2b `htree_select_accumulate_gqa_kernel`
       · 非底层：采用 online running-max 的 group-shared 重要度做 streaming Top-K（每次 merge 2*TOP_K 做 bitonic sort），
         同时将被淘汰的一半候选立即做 online-softmax 累积并丢弃（避免存 all_scores，避免额外重读 V）
-      · 底层：不做 Top-K，直接对全部候选做 online-softmax 累积
       · 输出当前层的 `(layer_max, layer_sum, layer_output)`，以及下一层用的 `next_selected_parents`
 
     - Kernel 2.3 `htree_merge_to_global_kernel_v2`
@@ -400,11 +403,11 @@ def sort_single(
     return x
 
 # ==========================================
-# Kernel 2.2: Fused Shared Top-K + Accumulate Non-TopK (GQA)
+# Kernel 2.2a: Bottom Layer Accumulate (GQA)
 # ==========================================
 
 @triton.jit
-def htree_fused_select_accumulate_gqa_kernel(
+def htree_bottom_accumulate_gqa_kernel(
     q,  # [B, T, H, K]
     layer_k,  # [B, N_layer, H_kv, K]
     layer_v,  # [B, N_layer, H_kv, V]
@@ -414,9 +417,7 @@ def htree_fused_select_accumulate_gqa_kernel(
     layer_max,  # [B, T, H]
     layer_sum,  # [B, T, H]
     layer_output,  # [B, T, H, V]
-    next_selected_parents,  # [B, T, H_kv, TOP_K]  (sorted asc, -1 padded; bottom: all -1)
     # params / constexpr
-    layer_idx: tl.constexpr,
     layer_power: tl.constexpr,
     B: tl.constexpr,
     T,
@@ -428,21 +429,11 @@ def htree_fused_select_accumulate_gqa_kernel(
     N_layer: tl.constexpr,
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
-    LOG_N: tl.constexpr,
-    N_DIMS_TOPK: tl.constexpr,
-    SCORE_VALID_THRESHOLD: tl.constexpr,
     NEG_INF: tl.constexpr,
-    DROP_BLOCK: tl.constexpr,
     scale,
 ):
-    """Fused per-layer forward for htree.
-
-    - Bottom layer: accumulate all candidates into (layer_max, layer_sum, layer_output); next_selected_parents = -1.
-    - Non-bottom layers:
-        1) Use group-shared online running-max to compute importance in one pass.
-        2) Streaming Top-K with merge-sort over 2*TOP_K per batch.
-        3) Immediately accumulate the dropped half (guaranteed non-TopK) and discard.
-        4) Output next_selected_parents (node indices) for the next layer (sorted asc, -1 padded).
+    """Bottom layer forward for htree: accumulate all candidates into
+    (layer_max, layer_sum, layer_output). No Top-K selection.
 
     Grid: (T, B*H_kv). One program per (b, t, h_kv) processing NUM_GROUPS query heads.
     """
@@ -450,8 +441,6 @@ def htree_fused_select_accumulate_gqa_kernel(
     i_bhk = tl.program_id(1)
     i_b = i_bhk // H_kv
     i_h_kv = i_bhk % H_kv
-
-    is_bottom_layer: tl.constexpr = (layer_idx == 0)
 
     # Rightmost node (causal boundary) at this layer
     rightmost_idx = i_t // layer_power
@@ -495,6 +484,8 @@ def htree_fused_select_accumulate_gqa_kernel(
     sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
     q_rope_1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G, K/2]
     q_rope_2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G, K/2]
+    # Merge two K/2 halves into single [G, K] for fused dot-product
+    q_rope = tl.reshape(tl.join(q_rope_1, q_rope_2), [NUM_GROUPS, K])  # [G, K]
 
     # Online-softmax state for contributions merged at this layer (per head)
     cur_max = tl.full([NUM_GROUPS], NEG_INF, dtype=tl.float32)
@@ -513,97 +504,195 @@ def htree_fused_select_accumulate_gqa_kernel(
     BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # == TOP_K
     num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
 
-    if is_bottom_layer:
-        # Bottom: no Top-K; directly accumulate all valid candidates.
-        o_v = tl.arange(0, V).to(tl.int64)
-        v_base = (
-            layer_v
-            + i_b.to(tl.int64) * N_layer * H_kv * V
-            + i_h_kv.to(tl.int64) * V
-        )
+    # Bottom: no Top-K; directly accumulate all valid candidates.
+    o_v = tl.arange(0, V).to(tl.int64)
+    v_base = (
+        layer_v
+        + i_b.to(tl.int64) * N_layer * H_kv * V
+        + i_h_kv.to(tl.int64) * V
+    )
 
-        for i_batch in range(num_batches):
-            for i_p in range(PARENTS_PER_BATCH):
-                parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
-                parent_idx = tl.load(
-                    prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
-                    mask=parent_off < TOP_K,
-                    other=-1,
-                ).to(tl.int32)
+    for i_batch in range(num_batches):
+        for i_p in range(PARENTS_PER_BATCH):
+            parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
+            parent_idx = tl.load(
+                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
+                mask=parent_off < TOP_K,
+                other=-1,
+            ).to(tl.int32)
 
-                if parent_idx >= 0:
-                    child_start = parent_idx * COMPRESSION_RATE
-                    rope_pos_start = parent_off * COMPRESSION_RATE
+            if parent_idx >= 0:
+                child_start = parent_idx * COMPRESSION_RATE
+                rope_pos_start = parent_off * COMPRESSION_RATE
 
-                    is_rightmost_parent = parent_idx == rightmost_parent_idx
-                    num_valid_children = tl.where(is_rightmost_parent, rightmost_child_idx + 1, COMPRESSION_RATE).to(tl.int32)
-                    child_mask = tl.arange(0, COMPRESSION_RATE) < num_valid_children  # [CR]
+                is_rightmost_parent = parent_idx == rightmost_parent_idx
+                num_valid_children = tl.where(is_rightmost_parent, rightmost_child_idx + 1, COMPRESSION_RATE).to(tl.int32)
+                child_mask = tl.arange(0, COMPRESSION_RATE) < num_valid_children  # [CR]
 
-                    # K with RoPE
-                    k_rope_1, k_rope_2 = load_k_with_rope_v2(
-                        layer_k, cos_cache, sin_cache,
-                        i_b, i_h_kv, child_start, rope_pos_start,
-                        N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
-                    )  # [CR, K/2]
+                # K with RoPE
+                k_rope_1, k_rope_2 = load_k_with_rope_v2(
+                    layer_k, cos_cache, sin_cache,
+                    i_b, i_h_kv, child_start, rope_pos_start,
+                    N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
+                )  # [CR, K/2]
+                # Merge two K/2 halves into single [CR, K]
+                k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [COMPRESSION_RATE, K])  # [CR, K]
 
-                    scores_gcr = (
-                        tl.sum(q_rope_1[:, None, :] * k_rope_1[None, :, :], axis=2)
-                        + tl.sum(q_rope_2[:, None, :] * k_rope_2[None, :, :], axis=2)
-                    )  # [G, CR]
-                    scores = tl.trans(scores_gcr)  # [CR, G]
+                scores_gcr = tl.sum(
+                    q_rope[:, None, :] * k_rope[None, :, :], axis=2
+                )  # [G, CR]
+                scores = tl.trans(scores_gcr)  # [CR, G]
 
-                    # V values (contiguous for this parent)
-                    child_rows = child_start + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
-                    row_mask = child_rows < N_layer
-                    v_ptrs = v_base + child_rows.to(tl.int64)[:, None] * (H_kv * V) + o_v[None, :]
-                    v_vals = tl.load(
-                        v_ptrs,
-                        mask=child_mask[:, None] & row_mask[:, None],
-                        other=0.0,
-                    ).to(tl.float32)  # [CR, V]
+                # V values (contiguous for this parent)
+                child_rows = child_start + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
+                row_mask = child_rows < N_layer
+                v_ptrs = v_base + child_rows.to(tl.int64)[:, None] * (H_kv * V) + o_v[None, :]
+                v_vals = tl.load(
+                    v_ptrs,
+                    mask=child_mask[:, None] & row_mask[:, None],
+                    other=0.0,
+                ).to(tl.float32)  # [CR, V]
 
-                    final_mask = child_mask[:, None]  # [CR,1] broadcast to [CR,G]
-                    masked_for_max = tl.where(final_mask, scores, NEG_INF)
-                    batch_max = tl.max(masked_for_max, axis=0)  # [G]
+                final_mask = child_mask[:, None]  # [CR,1] broadcast to [CR,G]
+                masked_for_max = tl.where(final_mask, scores, NEG_INF)
+                batch_max = tl.max(masked_for_max, axis=0)  # [G]
 
-                    new_max = tl.maximum(cur_max, batch_max)
-                    scale_m = tl.exp(cur_max - new_max)
-                    cur_sum = cur_sum * scale_m
-                    cur_output = cur_output * scale_m[:, None]
+                new_max = tl.maximum(cur_max, batch_max)
+                scale_m = tl.exp(cur_max - new_max)
+                cur_sum = cur_sum * scale_m
+                cur_output = cur_output * scale_m[:, None]
 
-                    scores_for_exp = tl.where(final_mask, scores, NEG_INF)
-                    p = tl.exp(scores_for_exp - new_max[None, :])
-                    p = tl.where(final_mask, p, 0.0)
+                scores_for_exp = tl.where(final_mask, scores, NEG_INF)
+                p = tl.exp(scores_for_exp - new_max[None, :])
+                p = tl.where(final_mask, p, 0.0)
 
-                    cur_sum = cur_sum + tl.sum(p, axis=0)
-                    dp = tl.sum(p[:, :, None] * v_vals[:, None, :], axis=0)  # [G, V]
-                    cur_output = cur_output + dp
-                    cur_max = new_max
+                cur_sum = cur_sum + tl.sum(p, axis=0)
+                dp = tl.sum(p[:, :, None] * v_vals[:, None, :], axis=0)  # [G, V]
+                cur_output = cur_output + dp
+                cur_max = new_max
 
-        # Store layer states
-        tl.store(layer_max + state_base + head_ids, cur_max)
-        tl.store(layer_sum + state_base + head_ids, cur_sum)
-        out_ptrs = layer_output + out_base + head_ids[:, None] * V + o_v[None, :]
-        tl.store(out_ptrs, cur_output)
+    # Store layer states
+    tl.store(layer_max + state_base + head_ids, cur_max)
+    tl.store(layer_sum + state_base + head_ids, cur_sum)
+    out_ptrs = layer_output + out_base + head_ids[:, None] * V + o_v[None, :]
+    tl.store(out_ptrs, cur_output)
 
-        # Bottom: next_selected_parents = -1
-        out_par_base = (
-            i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
-            + i_t.to(tl.int64) * H_kv * TOP_K
-            + i_h_kv.to(tl.int64) * TOP_K
-        )
-        tl.store(next_selected_parents + out_par_base + tl.arange(0, TOP_K), tl.full([TOP_K], -1, dtype=tl.int32))
-        return
 
-    # -----------------------------
-    # Non-bottom: streaming Top-K
-    # -----------------------------
+# ==========================================
+# Kernel 2.2b: Non-Bottom Select + Accumulate (GQA)
+# ==========================================
+
+@triton.jit
+def htree_select_accumulate_gqa_kernel(
+    q,  # [B, T, H, K]
+    layer_k,  # [B, N_layer, H_kv, K]
+    layer_v,  # [B, N_layer, H_kv, V]
+    prev_selected_parents,  # [B, T, H_kv, TOP_K]
+    cos_cache, sin_cache,  # [cache_size, K//2]
+    # outputs
+    layer_max,  # [B, T, H]
+    layer_sum,  # [B, T, H]
+    layer_output,  # [B, T, H, V]
+    next_selected_parents,  # [B, T, H_kv, TOP_K]  (sorted asc, -1 padded)
+    # params / constexpr
+    layer_power: tl.constexpr,
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    H_kv: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    N_layer: tl.constexpr,
+    COMPRESSION_RATE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    LOG_N: tl.constexpr,
+    N_DIMS_TOPK: tl.constexpr,
+    SCORE_VALID_THRESHOLD: tl.constexpr,
+    NEG_INF: tl.constexpr,
+    DROP_BLOCK: tl.constexpr,
+    scale,
+):
+    """Non-bottom layer forward for htree: streaming Top-K + accumulate dropped.
+
+    1) Use group-shared online running-max to compute importance in one pass.
+    2) Streaming Top-K with merge-sort over 2*TOP_K per batch.
+    3) Immediately accumulate the dropped half (guaranteed non-TopK) and discard.
+    4) Output next_selected_parents (node indices) for the next layer (sorted asc, -1 padded).
+
+    Grid: (T, B*H_kv). One program per (b, t, h_kv) processing NUM_GROUPS query heads.
+    """
+    i_t = tl.program_id(0)
+    i_bhk = tl.program_id(1)
+    i_b = i_bhk // H_kv
+    i_h_kv = i_bhk % H_kv
+
+    # Rightmost node (causal boundary) at this layer
+    rightmost_idx = i_t // layer_power
+    rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
+    rightmost_child_idx = rightmost_idx % COMPRESSION_RATE
+
+    T_i64 = T.to(tl.int64)
+
+    # Parents for this (b,t,h_kv)
+    prev_sel_base = (
+        i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
+        + i_t.to(tl.int64) * H_kv * TOP_K
+        + i_h_kv.to(tl.int64) * TOP_K
+    )
+    parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
+    valid_parent_list_mask = parent_list >= 0
+    num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
+
+    assert num_valid_parents > 0, "No valid candidates found"
+
+    n_cand = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
+
+    # Query RoPE position is the rightmost candidate position (n_cand-1)
+    rope_pos_q = n_cand - 1
+
+    # Load Q for all query heads in this KV group and apply RoPE
+    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)  # [G]
+    head_ids = (i_h_kv * NUM_GROUPS + g_ids).to(tl.int64)  # [G]
+    q_bt_base = (
+        i_b.to(tl.int64) * T_i64 * H * K
+        + i_t.to(tl.int64) * H * K
+    )
+    o_k_half = tl.arange(0, K // 2).to(tl.int64)
+    q_head_base = q + q_bt_base + head_ids[:, None] * K  # [G, 1]
+    q1 = tl.load(q_head_base + o_k_half[None, :])  # [G, K/2]
+    q2 = tl.load(q_head_base + (K // 2) + o_k_half[None, :])  # [G, K/2]
+
+    rope_pos_q_i64 = rope_pos_q.to(tl.int64)
+    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
+    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
+    q_rope_1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G, K/2]
+    q_rope_2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G, K/2]
+    # Merge two K/2 halves into single [G, K] for fused dot-product
+    q_rope = tl.reshape(tl.join(q_rope_1, q_rope_2), [NUM_GROUPS, K])  # [G, K]
+
+    # Online-softmax state for contributions merged at this layer (per head)
+    cur_max = tl.full([NUM_GROUPS], NEG_INF, dtype=tl.float32)
+    cur_sum = tl.zeros([NUM_GROUPS], dtype=tl.float32)
+    cur_output = tl.zeros([NUM_GROUPS, V], dtype=tl.float32)
+
+    # Output base pointers
+    state_base = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
+    out_base = (
+        i_b.to(tl.int64) * T_i64 * H * V
+        + i_t.to(tl.int64) * H * V
+    )
+
+    # Batch size in "parents": per-batch candidates == TOP_K.
+    PARENTS_PER_BATCH: tl.constexpr = TOP_K // COMPRESSION_RATE
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # == TOP_K
+    num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
 
     # Bit-packing masks for stable Top-K
     idx_mask = (1 << LOG_N) - 1
     rightmost_pos = (n_cand - 1).to(tl.int32)
     # Running max for group-shared importance (scalar packed as shape [1]).
-    sel_m = tl.full([1], NEG_INF, dtype=tl.float32) # TODO may spill at exp(score - sel_m)
+    sel_m = tl.full([1], NEG_INF, dtype=tl.float32)
 
     # Initialize running Top-K with encoded NEG_INF (tie-broken by index)
     init_idx = tl.arange(0, TOP_K).to(tl.int32)
@@ -657,10 +746,10 @@ def htree_fused_select_accumulate_gqa_kernel(
                     i_b, i_h_kv, child_start, rope_pos_start,
                     N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
                 )
+                k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [COMPRESSION_RATE, K])  # [CR, K]
 
-                scores_gcr = (
-                    tl.sum(q_rope_1[:, None, :] * k_rope_1[None, :, :], axis=2)
-                    + tl.sum(q_rope_2[:, None, :] * k_rope_2[None, :, :], axis=2)
+                scores_gcr = tl.sum(
+                    q_rope[:, None, :] * k_rope[None, :, :], axis=2
                 )  # [G, CR]
 
                 scores_for_exp = tl.where(child_valid[None, :], scores_gcr, NEG_INF)
@@ -778,10 +867,10 @@ def htree_fused_select_accumulate_gqa_kernel(
             k2 = tl.load(k_ptrs2, mask=node_valid[:, None], other=0.0).to(tl.float32)
             k_rope_1 = k1 * cos_k - k2 * sin_k
             k_rope_2 = k1 * sin_k + k2 * cos_k
+            k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [DROP_BLOCK, K])  # [DROP_BLOCK, K]
 
-            scores_gb = (
-                tl.sum(q_rope_1[:, None, :] * k_rope_1[None, :, :], axis=2)
-                + tl.sum(q_rope_2[:, None, :] * k_rope_2[None, :, :], axis=2)
+            scores_gb = tl.sum(
+                q_rope[:, None, :] * k_rope[None, :, :], axis=2
             )  # [G, DROP_BLOCK]
             scores = tl.trans(scores_gb)  # [DROP_BLOCK, G]
 
@@ -1043,35 +1132,51 @@ def htree_forward_v2(
         
         grid = (T, B * H)
 
-        # Kernel 2.2: Fused Select+Accumulate
-        nvtx.range_push("K2.2_FusedSelectAccumulate")
-        print("    Running fused online-select+accumulate kernel...")
+        # Kernel 2.2: Select+Accumulate (dispatch bottom vs non-bottom)
+        nvtx.range_push("K2.2_SelectAccumulate")
         torch.cuda.synchronize()
         start_k22 = torch.cuda.Event(enable_timing=True)
         end_k22 = torch.cuda.Event(enable_timing=True)
         start_k22.record()
 
         grid_kv = (T, B * H_kv)
-        htree_fused_select_accumulate_gqa_kernel[grid_kv](
-            q, k_layer, v_layer,
-            prev_selected_parents,
-            cos_cache, sin_cache,
-            layer_max, layer_sum, layer_output,
-            next_selected_parents,
-            layer_idx=layer_idx,
-            layer_power=layer_power,
-            B=B, T=T, H=H, H_kv=H_kv,
-            NUM_GROUPS=NUM_GROUPS,
-            K=K, V=V, N_layer=N_layer,
-            COMPRESSION_RATE=compression_rate,
-            TOP_K=top_k_per_layer,
-            LOG_N=LOG_N,
-            N_DIMS_TOPK=N_DIMS_TOPK,
-            SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
-            NEG_INF=HTREE_SCORE_NEG_INF,
-            DROP_BLOCK=DROP_BLOCK,
-            scale=scale,
-        )
+        if is_bottom_layer:
+            print("    Running bottom accumulate kernel (K2.2a)...")
+            htree_bottom_accumulate_gqa_kernel[grid_kv](
+                q, k_layer, v_layer,
+                prev_selected_parents,
+                cos_cache, sin_cache,
+                layer_max, layer_sum, layer_output,
+                layer_power=layer_power,
+                B=B, T=T, H=H, H_kv=H_kv,
+                NUM_GROUPS=NUM_GROUPS,
+                K=K, V=V, N_layer=N_layer,
+                COMPRESSION_RATE=compression_rate,
+                TOP_K=top_k_per_layer,
+                NEG_INF=HTREE_SCORE_NEG_INF,
+                scale=scale,
+            )
+        else:
+            print("    Running select+accumulate kernel (K2.2b)...")
+            htree_select_accumulate_gqa_kernel[grid_kv](
+                q, k_layer, v_layer,
+                prev_selected_parents,
+                cos_cache, sin_cache,
+                layer_max, layer_sum, layer_output,
+                next_selected_parents,
+                layer_power=layer_power,
+                B=B, T=T, H=H, H_kv=H_kv,
+                NUM_GROUPS=NUM_GROUPS,
+                K=K, V=V, N_layer=N_layer,
+                COMPRESSION_RATE=compression_rate,
+                TOP_K=top_k_per_layer,
+                LOG_N=LOG_N,
+                N_DIMS_TOPK=N_DIMS_TOPK,
+                SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
+                NEG_INF=HTREE_SCORE_NEG_INF,
+                DROP_BLOCK=DROP_BLOCK,
+                scale=scale,
+            )
 
         end_k22.record()
         torch.cuda.synchronize()
@@ -1139,7 +1244,8 @@ __all__ = [
     'htree_forward_v2',
     'htree_build_kernel_v2',
     'htree_compute_lse_gqa_kernel',
-    'htree_fused_select_accumulate_gqa_kernel',
+    'htree_bottom_accumulate_gqa_kernel',
+    'htree_select_accumulate_gqa_kernel',
     'htree_merge_to_global_kernel_v2',
     'htree_final_normalize_kernel_v2',
 ]
