@@ -8,3 +8,4 @@ __pycache__/
 *debug*.*
 *.nsys-rep
 .*/
+*.ncu-rep

@@ -16,7 +16,6 @@ from typing import Callable, Tuple
 import torch
 
 from src.parallel import htree_forward_v2
-from ref_nsa.nsa_parallel import parallel_nsa
 
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 def _c(text: str, code: str) -> str:
@@ -145,6 +144,7 @@ def run_benchmarks(args: argparse.Namespace) -> None:
         )
 
     def run_nsa():
+        from ref_nsa.nsa_parallel import parallel_nsa
         # Passing g_cmp triggers the full pipeline:
         # 1. mean_pooling (Compression)
         # 2. parallel_nsa_compression + parallel_nsa_topk (Selection)
@@ -171,12 +171,51 @@ def run_benchmarks(args: argparse.Namespace) -> None:
     print(_dim(f"warmup={args.warmup}, iters={args.iters}"))
     print(_warn("Note: NSA runs FULL pipeline (pooling + compression + selection + execution)"))
 
-    htree_ms = benchmark(run_htree, warmup=args.warmup, iters=args.iters)
-    nsa_ms = benchmark(run_nsa, warmup=args.warmup, iters=args.iters)
+    run_htree_flag = args.only in ("all", "htree")
+    run_nsa_flag = args.only in ("all", "nsa")
+
+    # ---- Profile mode: warmup without ncu, then profile a single iteration ----
+    if args.profile:
+        print(_hdr("\n>>> PROFILE mode enabled <<<"))
+        print(_dim("Warmup runs (profiler OFF) — Triton JIT + cache warm ..."))
+
+        targets = []
+        if run_htree_flag:
+            targets.append(("htree", run_htree))
+        if run_nsa_flag:
+            targets.append(("nsa", run_nsa))
+
+        # Warmup: run enough iterations so Triton kernels are fully compiled
+        for name, fn in targets:
+            print(f"  warming up {name} ({args.warmup} iters) ...")
+            _cuda_sync()
+            with torch.no_grad():
+                for _ in range(max(args.warmup, 1)):
+                    fn()
+            _cuda_sync()
+            print(f"  {name} warmup done.")
+
+        # Now profile: only kernels between start/stop are captured by ncu
+        print(_ok("Starting CUDA profiler — profiling 1 iteration ..."))
+        torch.cuda.cudart().cudaProfilerStart()
+        with torch.no_grad():
+            for name, fn in targets:
+                fn()
+        torch.cuda.cudart().cudaProfilerStop()
+        _cuda_sync()
+        print(_ok("CUDA profiler stopped. Profile data captured."))
+        print(_hdr("========================================\n"))
+        return  # skip normal benchmark + NSA breakdown
+
+    # ---- Normal benchmark mode ----
+    htree_ms = benchmark(run_htree, warmup=args.warmup, iters=args.iters) if run_htree_flag else None
+    nsa_ms = benchmark(run_nsa, warmup=args.warmup, iters=args.iters) if run_nsa_flag else None
 
     print(_hdr("Results (avg ms / iter):"))
-    print(f"  htree: {_ok(f'{htree_ms:.3f} ms')}")
-    print(f"  NSA  : {_ok(f'{nsa_ms:.3f} ms')}")
+    if htree_ms is not None:
+        print(f"  htree: {_ok(f'{htree_ms:.3f} ms')}")
+    if nsa_ms is not None:
+        print(f"  NSA  : {_ok(f'{nsa_ms:.3f} ms')}")
     print(_hdr("Params summary:"))
     print(
         "  experiment: "
@@ -205,59 +244,60 @@ def run_benchmarks(args: argparse.Namespace) -> None:
     print(_hdr("========================================\n"))
 
     # --- Profile NSA Breakdown ---
-    print(_hdr("Profiling NSA breakdown..."))
-    # Imports
-    from fla.ops.utils.pooling import mean_pooling  # type: ignore[import-not-found]
-    from ref_nsa.nsa_compression import parallel_nsa_compression
-    from ref_nsa.nsa_parallel import parallel_nsa_topk, parallel_nsa_fwd
+    if run_nsa_flag:
+        print(_hdr("Profiling NSA breakdown..."))
+        # Imports
+        from fla.ops.utils.pooling import mean_pooling  # type: ignore[import-not-found]
+        from ref_nsa.nsa_compression import parallel_nsa_compression
+        from ref_nsa.nsa_parallel import parallel_nsa_topk, parallel_nsa_fwd
 
-    # Warmup
-    for _ in range(3):
-        k_cmp, v_cmp = mean_pooling(k, args.block_size, None), mean_pooling(v, args.block_size, None)
-        o_cmp, lse_cmp = parallel_nsa_compression(q, k_cmp, v_cmp, args.block_size, scale, None)
-        block_indices = parallel_nsa_topk(q, k_cmp, lse_cmp, args.s_blocks, args.block_size, scale, None)
-        parallel_nsa_fwd(q, k, v, block_indices, args.s_blocks, args.block_size, scale, None)
-    
-    _cuda_sync()
-    
-    start = torch.cuda.Event(enable_timing=True)
-    e_pool = torch.cuda.Event(enable_timing=True)
-    e_comp = torch.cuda.Event(enable_timing=True)
-    e_sel = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    
-    t_pool = 0.0
-    t_comp = 0.0
-    t_sel = 0.0
-    t_exec = 0.0
-    
-    for _ in range(args.iters):
-        start.record()
-        k_cmp, v_cmp = mean_pooling(k, args.block_size, None), mean_pooling(v, args.block_size, None)
-        e_pool.record()
-        
-        o_cmp, lse_cmp = parallel_nsa_compression(q, k_cmp, v_cmp, args.block_size, scale, None)
-        e_comp.record()
-        
-        block_indices = parallel_nsa_topk(q, k_cmp, lse_cmp, args.s_blocks, args.block_size, scale, None)
-        e_sel.record()
-        
-        parallel_nsa_fwd(q, k, v, block_indices, args.s_blocks, args.block_size, scale, None)
-        end.record()
+        # Warmup
+        for _ in range(3):
+            k_cmp, v_cmp = mean_pooling(k, args.block_size, None), mean_pooling(v, args.block_size, None)
+            o_cmp, lse_cmp = parallel_nsa_compression(q, k_cmp, v_cmp, args.block_size, scale, None)
+            block_indices = parallel_nsa_topk(q, k_cmp, lse_cmp, args.s_blocks, args.block_size, scale, None)
+            parallel_nsa_fwd(q, k, v, block_indices, args.s_blocks, args.block_size, scale, None)
         
         _cuda_sync()
-        t_pool += start.elapsed_time(e_pool)
-        t_comp += e_pool.elapsed_time(e_comp)
-        t_sel += e_comp.elapsed_time(e_sel)
-        t_exec += e_sel.elapsed_time(end)
         
-    print(f"NSA Breakdown (avg over {args.iters} iters):")
-    print(f"  Pooling    : {t_pool/args.iters:.3f} ms")
-    print(f"  Compression: {t_comp/args.iters:.3f} ms")
-    print(f"  Selection  : {t_sel/args.iters:.3f} ms")
-    print(f"  Execution  : {t_exec/args.iters:.3f} ms")
-    print(f"  Total      : {(t_pool+t_comp+t_sel+t_exec)/args.iters:.3f} ms")
-    print(_hdr("========================================\n"))
+        start = torch.cuda.Event(enable_timing=True)
+        e_pool = torch.cuda.Event(enable_timing=True)
+        e_comp = torch.cuda.Event(enable_timing=True)
+        e_sel = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        
+        t_pool = 0.0
+        t_comp = 0.0
+        t_sel = 0.0
+        t_exec = 0.0
+        
+        for _ in range(args.iters):
+            start.record()
+            k_cmp, v_cmp = mean_pooling(k, args.block_size, None), mean_pooling(v, args.block_size, None)
+            e_pool.record()
+            
+            o_cmp, lse_cmp = parallel_nsa_compression(q, k_cmp, v_cmp, args.block_size, scale, None)
+            e_comp.record()
+            
+            block_indices = parallel_nsa_topk(q, k_cmp, lse_cmp, args.s_blocks, args.block_size, scale, None)
+            e_sel.record()
+            
+            parallel_nsa_fwd(q, k, v, block_indices, args.s_blocks, args.block_size, scale, None)
+            end.record()
+            
+            _cuda_sync()
+            t_pool += start.elapsed_time(e_pool)
+            t_comp += e_pool.elapsed_time(e_comp)
+            t_sel += e_comp.elapsed_time(e_sel)
+            t_exec += e_sel.elapsed_time(end)
+            
+        print(f"NSA Breakdown (avg over {args.iters} iters):")
+        print(f"  Pooling    : {t_pool/args.iters:.3f} ms")
+        print(f"  Compression: {t_comp/args.iters:.3f} ms")
+        print(f"  Selection  : {t_sel/args.iters:.3f} ms")
+        print(f"  Execution  : {t_exec/args.iters:.3f} ms")
+        print(f"  Total      : {(t_pool+t_comp+t_sel+t_exec)/args.iters:.3f} ms")
+        print(_hdr("========================================\n"))
 
 
 def parse_args() -> argparse.Namespace:
@@ -282,6 +322,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float32")
+    parser.add_argument("--only", choices=["all", "htree", "nsa"], default="all",
+                        help="Run only a subset of benchmarks (default: all)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Profile mode: warmup without profiler, then capture a single "
+                             "iteration with cudaProfilerStart/Stop. Use with: "
+                             "ncu --profile-from-start off -o <output> python speed_test.py --profile")
     return parser.parse_args()
 
 

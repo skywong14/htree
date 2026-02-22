@@ -944,7 +944,7 @@ def htree_forward_v2(
         next_k = torch.empty(B, next_len, H_kv, K, dtype=dtype, device=device)
         next_v = torch.empty(B, next_len, H_kv, V, dtype=dtype, device=device)
         
-        BLOCK_SIZE = 128
+        BLOCK_SIZE = 8
         grid = (triton.cdiv(next_len, BLOCK_SIZE), B * H_kv)
         
         torch.cuda.synchronize()
