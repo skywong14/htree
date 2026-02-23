@@ -365,152 +365,144 @@ def htree_bottom_accumulate_gqa_kernel(
     COMPRESSION_RATE: tl.constexpr,
     TOP_K: tl.constexpr,
     NEG_INF: tl.constexpr,
+    G_PAD: tl.constexpr,
+    TILE_P: tl.constexpr,
     scale,
 ):
-    """Bottom layer forward for htree: accumulate all candidates into
-    (layer_max, layer_sum, layer_output). No Top-K selection.
+    """Bottom layer forward: batch-gather K/V tiles + tl.dot (tensor core).
 
-    Grid: (T, B*H_kv). One program per (b, t, h_kv) processing NUM_GROUPS query heads.
+    Processes TILE_P parents (= TILE_P * CR tokens) per iteration instead of
+    one parent at a time, using tl.dot for QK^T and PV accumulation.
+
+    Grid: (T, B*H_kv). One program per (b, t, h_kv).
     """
     i_t = tl.program_id(0)
     i_bhk = tl.program_id(1)
     i_b = i_bhk // H_kv
     i_h_kv = i_bhk % H_kv
 
-    # Rightmost node (causal boundary) at this layer
     rightmost_idx = i_t // layer_power
     rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
     rightmost_child_idx = rightmost_idx % COMPRESSION_RATE
 
     T_i64 = T.to(tl.int64)
 
-    # Parents for this (b,t,h_kv)
     prev_sel_base = (
         i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
         + i_t.to(tl.int64) * H_kv * TOP_K
         + i_h_kv.to(tl.int64) * TOP_K
     )
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
-    valid_parent_list_mask = parent_list >= 0
-    num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
+    num_valid_parents = tl.sum((parent_list >= 0).to(tl.int32))
 
-    # assert num_valid_parents > 0
     assert num_valid_parents > 0, "No valid candidates found"
 
     n_cand = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
-
-    # Query RoPE position is the rightmost candidate position (n_cand-1)
     rope_pos_q = n_cand - 1
 
-    # Load Q for all query heads in this KV group and apply RoPE
-    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)  # [G]
-    head_ids = (i_h_kv * NUM_GROUPS + g_ids).to(tl.int64)  # [G]
-    q_bt_base = (
-        i_b.to(tl.int64) * T_i64 * H * K
-        + i_t.to(tl.int64) * H * K
-    )
+    # ---- Load Q for G_PAD heads (zero-pad when G_PAD > NUM_GROUPS) ----
+    g_ids = tl.arange(0, G_PAD).to(tl.int64)
+    g_valid = g_ids < NUM_GROUPS
+    head_ids = (i_h_kv.to(tl.int64) * NUM_GROUPS + g_ids) * g_valid.to(tl.int64)
+
     o_k_half = tl.arange(0, K // 2).to(tl.int64)
-    q_head_base = q + q_bt_base + head_ids[:, None] * K  # [G, 1]
-    q1 = tl.load(q_head_base + o_k_half[None, :])  # [G, K/2]
-    q2 = tl.load(q_head_base + (K // 2) + o_k_half[None, :])  # [G, K/2]
+    q_bt_base = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
+    q_ptrs = q + q_bt_base + head_ids[:, None] * K
+    q1 = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q2 = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
 
-    rope_pos_q_i64 = rope_pos_q.to(tl.int64)
-    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
-    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
-    q_rope_1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G, K/2]
-    q_rope_2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G, K/2]
-    # Merge two K/2 halves into single [G, K] for fused dot-product
-    q_rope = tl.reshape(tl.join(q_rope_1, q_rope_2), [NUM_GROUPS, K])  # [G, K]
+    cos_q = tl.load(cos_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    sin_q = tl.load(sin_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    q_r1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G_PAD, K//2]
+    q_r2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G_PAD, K//2]
 
-    # Online-softmax state for contributions merged at this layer (per head)
-    cur_max = tl.full([NUM_GROUPS], NEG_INF, dtype=tl.float32)
-    cur_sum = tl.zeros([NUM_GROUPS], dtype=tl.float32)
-    cur_output = tl.zeros([NUM_GROUPS, V], dtype=tl.float32)
+    # ---- Online-softmax state (G_PAD-wide) ----
+    cur_max = tl.full([G_PAD], NEG_INF, dtype=tl.float32)
+    cur_sum = tl.zeros([G_PAD], dtype=tl.float32)
+    cur_output = tl.zeros([G_PAD, V], dtype=tl.float32)
 
-    # Output base pointers
-    state_base = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
-    out_base = (
-        i_b.to(tl.int64) * T_i64 * H * V
-        + i_t.to(tl.int64) * H * V
-    )
+    # ---- Precompute base pointers & offsets ----
+    TILE_N: tl.constexpr = TILE_P * COMPRESSION_RATE
+    k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
+    v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
 
-    # Batch size in "parents": per-batch candidates == TOP_K.
-    PARENTS_PER_BATCH: tl.constexpr = TOP_K // COMPRESSION_RATE
-    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # == TOP_K
-    num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
-
-    # Bottom: no Top-K; directly accumulate all valid candidates.
+    o_n = tl.arange(0, TILE_N).to(tl.int32)
+    parent_in_tile = o_n // COMPRESSION_RATE   # [TILE_N] which parent (0..TILE_P-1)
+    child_in_tile = o_n % COMPRESSION_RATE     # [TILE_N] which child  (0..CR-1)
     o_v = tl.arange(0, V).to(tl.int64)
-    v_base = (
-        layer_v
-        + i_b.to(tl.int64) * N_layer * H_kv * V
-        + i_h_kv.to(tl.int64) * V
-    )
 
-    for i_batch in range(num_batches):
-        for i_p in range(PARENTS_PER_BATCH):
-            parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
-            parent_idx = tl.load(
-                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
-                mask=parent_off < TOP_K,
-                other=-1,
-            ).to(tl.int32)
+    state_base = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
+    out_base = i_b.to(tl.int64) * T_i64 * H * V + i_t.to(tl.int64) * H * V
 
-            if parent_idx >= 0:
-                child_start = parent_idx * COMPRESSION_RATE
-                rope_pos_start = parent_off * COMPRESSION_RATE
+    # ---- Main loop: TILE_P parents per iteration (flat TILE_N indexing) ----
+    #  All loads are UNCONDITIONAL (indices clamped to valid ranges) to avoid
+    #  Triton layout conflicts between 1-D masked loads and 2-D tl.dot results.
+    #  Validity is enforced purely by masking scores to NEG_INF / probs to 0.
+    num_tiles = (num_valid_parents + TILE_P - 1) // TILE_P
+    for _i in range(num_tiles):
+        tile_base = (_i * TILE_P).to(tl.int32)
 
-                is_rightmost_parent = parent_idx == rightmost_parent_idx
-                num_valid_children = tl.where(is_rightmost_parent, rightmost_child_idx + 1, COMPRESSION_RATE).to(tl.int32)
-                child_mask = tl.arange(0, COMPRESSION_RATE) < num_valid_children  # [CR]
+        # Global parent offset for each of the TILE_N positions
+        p_offs = tile_base + parent_in_tile                               # [TILE_N]
 
-                # K with RoPE
-                k_rope_1, k_rope_2 = load_k_with_rope_v2(
-                    layer_k, cos_cache, sin_cache,
-                    i_b, i_h_kv, child_start, rope_pos_start,
-                    N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
-                )  # [CR, K/2]
-                # Merge two K/2 halves into single [CR, K]
-                k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [COMPRESSION_RATE, K])  # [CR, K]
+        # Unconditional load — clamp index to [0, TOP_K-1]
+        safe_p_offs = tl.minimum(p_offs, TOP_K - 1).to(tl.int64)
+        p_idx = tl.load(
+            prev_selected_parents + prev_sel_base + safe_p_offs
+        ).to(tl.int32)                                                    # [TILE_N]
 
-                scores_gcr = tl.sum(
-                    q_rope[:, None, :] * k_rope[None, :, :], axis=2
-                )  # [G, CR]
-                scores = tl.trans(scores_gcr)  # [CR, G]
+        # Compute validity mask (pure 1-D, no layout interaction with tl.dot)
+        p_valid = (p_offs < num_valid_parents) & (p_offs < TOP_K) & (p_idx >= 0)
+        is_rm = p_idx == rightmost_parent_idx
+        ch_ok = ~is_rm | (child_in_tile <= rightmost_child_idx)
+        rows = tl.maximum(p_idx, 0) * COMPRESSION_RATE + child_in_tile
+        valid = p_valid & ch_ok & (rows >= 0) & (rows < N_layer)
 
-                # V values (contiguous for this parent)
-                child_rows = child_start + tl.arange(0, COMPRESSION_RATE).to(tl.int32)  # [CR]
-                row_mask = child_rows < N_layer
-                v_ptrs = v_base + child_rows.to(tl.int64)[:, None] * (H_kv * V) + o_v[None, :]
-                v_vals = tl.load(
-                    v_ptrs,
-                    mask=child_mask[:, None] & row_mask[:, None],
-                    other=0.0,
-                ).to(tl.float32)  # [CR, V]
+        # Clamp row indices for unconditional K / V loads
+        safe_rows = tl.minimum(tl.maximum(rows, 0), N_layer - 1).to(tl.int64)
 
-                final_mask = child_mask[:, None]  # [CR,1] broadcast to [CR,G]
-                masked_for_max = tl.where(final_mask, scores, NEG_INF)
-                batch_max = tl.max(masked_for_max, axis=0)  # [G]
+        # ---- Gather K (two halves, unconditional) ----
+        k_row = k_base + safe_rows[:, None] * (H_kv * K)
+        k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)           # [TILE_N, K//2]
+        k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-                new_max = tl.maximum(cur_max, batch_max)
-                scale_m = tl.exp(cur_max - new_max)
-                cur_sum = cur_sum * scale_m
-                cur_output = cur_output * scale_m[:, None]
+        # ---- RoPE on K (flat position = tile_base * CR + o_n, contiguous) ----
+        rp = tile_base.to(tl.int64) * COMPRESSION_RATE + o_n.to(tl.int64)
+        rp = tl.maximum(rp, 0)
+        ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+        sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+        kr1 = k1 * ck - k2 * sk                                          # [TILE_N, K//2]
+        kr2 = k1 * sk + k2 * ck                                          # [TILE_N, K//2]
 
-                scores_for_exp = tl.where(final_mask, scores, NEG_INF)
-                p = tl.exp(scores_for_exp - new_max[None, :])
-                p = tl.where(final_mask, p, 0.0)
+        # ---- Scores via split tl.dot ----
+        # [G_PAD, K//2] × [K//2, TILE_N]  +  same  →  [G_PAD, TILE_N]
+        scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
+        scores = tl.where(valid[None, :] & g_valid[:, None], scores, NEG_INF)
 
-                cur_sum = cur_sum + tl.sum(p, axis=0)
-                dp = tl.sum(p[:, :, None] * v_vals[:, None, :], axis=0)  # [G, V]
-                cur_output = cur_output + dp
-                cur_max = new_max
+        # ---- Gather V (unconditional) ----
+        v_row = v_base + safe_rows[:, None] * (H_kv * V)
+        vt = tl.load(v_row + o_v[None, :]).to(tl.float32)                # [TILE_N, V]
 
-    # Store layer states
-    tl.store(layer_max + state_base + head_ids, cur_max)
-    tl.store(layer_sum + state_base + head_ids, cur_sum)
+        # ---- Online softmax ----
+        tile_m = tl.max(scores, axis=1)                                   # [G_PAD]
+        new_m = tl.maximum(cur_max, tile_m)
+        alpha = tl.exp(cur_max - new_m)
+        cur_sum = cur_sum * alpha
+        cur_output = cur_output * alpha[:, None]
+
+        p = tl.exp(scores - new_m[:, None])
+        p = tl.where(valid[None, :] & g_valid[:, None], p, 0.0)
+        cur_sum = cur_sum + tl.sum(p, axis=1)
+
+        # ---- PV via tl.dot  [G_PAD, TILE_N] × [TILE_N, V] → [G_PAD, V] ----
+        cur_output = cur_output + tl.dot(p.to(vt.dtype), vt)
+        cur_max = new_m
+
+    # ---- Store (first NUM_GROUPS heads only) ----
+    tl.store(layer_max + state_base + head_ids, cur_max, mask=g_valid)
+    tl.store(layer_sum + state_base + head_ids, cur_sum, mask=g_valid)
     out_ptrs = layer_output + out_base + head_ids[:, None] * V + o_v[None, :]
-    tl.store(out_ptrs, cur_output)
+    tl.store(out_ptrs, cur_output, mask=g_valid[:, None])
 
 
 # ==========================================
@@ -1038,6 +1030,10 @@ def htree_forward_v2(
     # Dropped candidates are accumulated in blocks for better throughput.
     DROP_BLOCK = 32
     assert top_k_per_layer % DROP_BLOCK == 0, f"top_k_per_layer ({top_k_per_layer}) must be divisible by DROP_BLOCK ({DROP_BLOCK})"
+
+    # Bottom kernel: batch TILE_P parents per iteration; pad G to ≥16 for tl.dot
+    TILE_P = 4
+    G_PAD = max(triton.next_power_of_2(NUM_GROUPS), 16)
     
      # 为最顶层初始化 prev_selected_parents
     top_layer_power = compression_rate ** (num_layers - 1)
@@ -1089,6 +1085,8 @@ def htree_forward_v2(
                 COMPRESSION_RATE=compression_rate,
                 TOP_K=top_k_per_layer,
                 NEG_INF=HTREE_SCORE_NEG_INF,
+                G_PAD=G_PAD,
+                TILE_P=TILE_P,
                 scale=scale,
             )
         else:
