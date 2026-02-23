@@ -807,7 +807,8 @@ def htree_select_accumulate_gqa_kernel(
         merged_input = tl.reshape(merged_2d, [2 * TOP_K])
 
         N_DIMS_MERGE: tl.constexpr = N_DIMS_TOPK + 1  # log2(2*TOP_K)
-        sorted_merged = sort_single(merged_input, N_DIMS_MERGE, 1, descending=True)
+        sorted_merged = tl.sort(merged_input, descending=True)
+        #sorted_merged = sort_single(merged_input, N_DIMS_MERGE, 1, descending=True)
         merged_sorted_2d = tl.reshape(sorted_merged, [2, TOP_K])
 
         # Row 0: new running Top-K; Row 1: dropped candidates (guaranteed non-TopK)
