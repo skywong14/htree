@@ -538,171 +538,142 @@ def htree_select_accumulate_gqa_kernel(
     SCORE_VALID_THRESHOLD: tl.constexpr,
     NEG_INF: tl.constexpr,
     DROP_BLOCK: tl.constexpr,
+    G_PAD: tl.constexpr,
     scale,
 ):
-    """Non-bottom layer forward for htree: streaming Top-K + accumulate dropped.
+    """Non-bottom layer forward: streaming Top-K + accumulate dropped.
 
-    1) Use group-shared online running-max to compute importance in one pass.
-    2) Streaming Top-K with merge-sort over 2*TOP_K per batch.
-    3) Immediately accumulate the dropped half (guaranteed non-TopK) and discard.
-    4) Output next_selected_parents (node indices) for the next layer (sorted asc, -1 padded).
+    Uses tl.dot (tensor core) for QK^T and PV instead of element-wise broadcast.
 
-    Grid: (T, B*H_kv). One program per (b, t, h_kv) processing NUM_GROUPS query heads.
+    Grid: (T, B*H_kv). One program per (b, t, h_kv).
     """
     i_t = tl.program_id(0)
     i_bhk = tl.program_id(1)
     i_b = i_bhk // H_kv
     i_h_kv = i_bhk % H_kv
 
-    # Rightmost node (causal boundary) at this layer
     rightmost_idx = i_t // layer_power
     rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
     rightmost_child_idx = rightmost_idx % COMPRESSION_RATE
 
     T_i64 = T.to(tl.int64)
 
-    # Parents for this (b,t,h_kv)
     prev_sel_base = (
         i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
         + i_t.to(tl.int64) * H_kv * TOP_K
         + i_h_kv.to(tl.int64) * TOP_K
     )
     parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
-    valid_parent_list_mask = parent_list >= 0
-    num_valid_parents = tl.sum(valid_parent_list_mask.to(tl.int32))
+    num_valid_parents = tl.sum((parent_list >= 0).to(tl.int32))
 
     assert num_valid_parents > 0, "No valid candidates found"
 
     n_cand = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
-
-    # Query RoPE position is the rightmost candidate position (n_cand-1)
     rope_pos_q = n_cand - 1
 
-    # Load Q for all query heads in this KV group and apply RoPE
-    g_ids = tl.arange(0, NUM_GROUPS).to(tl.int64)  # [G]
-    head_ids = (i_h_kv * NUM_GROUPS + g_ids).to(tl.int64)  # [G]
-    q_bt_base = (
-        i_b.to(tl.int64) * T_i64 * H * K
-        + i_t.to(tl.int64) * H * K
-    )
+    # ---- Load Q for G_PAD heads (zero-pad when G_PAD > NUM_GROUPS) ----
+    g_ids = tl.arange(0, G_PAD).to(tl.int64)
+    g_valid = g_ids < NUM_GROUPS
+    head_ids = (i_h_kv.to(tl.int64) * NUM_GROUPS + g_ids) * g_valid.to(tl.int64)
+
     o_k_half = tl.arange(0, K // 2).to(tl.int64)
-    q_head_base = q + q_bt_base + head_ids[:, None] * K  # [G, 1]
-    q1 = tl.load(q_head_base + o_k_half[None, :])  # [G, K/2]
-    q2 = tl.load(q_head_base + (K // 2) + o_k_half[None, :])  # [G, K/2]
+    q_bt_base = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
+    q_ptrs = q + q_bt_base + head_ids[:, None] * K
+    q1 = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q2 = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
 
-    rope_pos_q_i64 = rope_pos_q.to(tl.int64)
-    cos_q = tl.load(cos_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
-    sin_q = tl.load(sin_cache + rope_pos_q_i64 * (K // 2) + o_k_half)  # [K/2]
-    q_rope_1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G, K/2]
-    q_rope_2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G, K/2]
-    # Merge two K/2 halves into single [G, K] for fused dot-product
-    q_rope = tl.reshape(tl.join(q_rope_1, q_rope_2), [NUM_GROUPS, K])  # [G, K]
+    cos_q = tl.load(cos_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    sin_q = tl.load(sin_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    q_r1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G_PAD, K//2]
+    q_r2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G_PAD, K//2]
 
-    # Online-softmax state for contributions merged at this layer (per head)
-    cur_max = tl.full([NUM_GROUPS], NEG_INF, dtype=tl.float32)
-    cur_sum = tl.zeros([NUM_GROUPS], dtype=tl.float32)
-    cur_output = tl.zeros([NUM_GROUPS, V], dtype=tl.float32)
+    # ---- Online-softmax state (G_PAD-wide) ----
+    cur_max = tl.full([G_PAD], NEG_INF, dtype=tl.float32)
+    cur_sum = tl.zeros([G_PAD], dtype=tl.float32)
+    cur_output = tl.zeros([G_PAD, V], dtype=tl.float32)
 
-    # Output base pointers
     state_base = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
-    out_base = (
-        i_b.to(tl.int64) * T_i64 * H * V
-        + i_t.to(tl.int64) * H * V
-    )
+    out_base = i_b.to(tl.int64) * T_i64 * H * V + i_t.to(tl.int64) * H * V
 
-    # Batch size in "parents": per-batch candidates == TOP_K.
     PARENTS_PER_BATCH: tl.constexpr = TOP_K // COMPRESSION_RATE
-    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE  # == TOP_K
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
     num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
 
-    # Bit-packing masks for stable Top-K
     idx_mask = (1 << LOG_N) - 1
     rightmost_pos = (n_cand - 1).to(tl.int32)
-    # Running max for group-shared importance (scalar packed as shape [1]).
     sel_m = tl.full([1], NEG_INF, dtype=tl.float32)
 
-    # Initialize running Top-K with encoded NEG_INF (tie-broken by index)
     init_idx = tl.arange(0, TOP_K).to(tl.int32)
     init_imp = tl.full([TOP_K], NEG_INF, dtype=tl.float32)
     init_int = init_imp.to(tl.int32, bitcast=True)
     init_encoded = (init_int & ~idx_mask) | (init_idx & idx_mask)
     running_topk_encoded = init_encoded.to(tl.float32, bitcast=True)
 
-    # Precompute base pointers for gather loads (dropped candidates)
     o_v = tl.arange(0, V).to(tl.int64)
-    k_base = (
-        layer_k
-        + i_b.to(tl.int64) * N_layer * H_kv * K
-        + i_h_kv.to(tl.int64) * K
-    )
-    v_base = (
-        layer_v
-        + i_b.to(tl.int64) * N_layer * H_kv * V
-        + i_h_kv.to(tl.int64) * V
-    )
+    k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
+    v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
 
-    # Number of drop blocks (compile-time)
     N_DROP_BLOCKS: tl.constexpr = TOP_K // DROP_BLOCK
+    o_cr = tl.arange(0, COMPRESSION_RATE).to(tl.int32)
 
     for i_batch in range(num_batches):
-        # Compute per-batch importance for exactly BC==TOP_K candidate positions.
+        # ---- Phase 1: per-parent importance via tl.dot ----
         imp_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
         batch_m = tl.full([1], NEG_INF, dtype=tl.float32)
 
         for i_p in range(PARENTS_PER_BATCH):
             parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
+            safe_poff = tl.minimum(parent_off, TOP_K - 1).to(tl.int64)
             parent_idx = tl.load(
-                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
-                mask=parent_off < TOP_K,
-                other=-1,
+                prev_selected_parents + prev_sel_base + safe_poff
             ).to(tl.int32)
+            poff_valid = parent_off < TOP_K
 
-            if parent_idx >= 0:
+            if parent_idx >= 0 and poff_valid:
                 child_start = parent_idx * COMPRESSION_RATE
                 rope_pos_start = parent_off * COMPRESSION_RATE
 
-                is_rightmost_parent = parent_idx == rightmost_parent_idx
-                num_valid_children = tl.where(is_rightmost_parent, rightmost_child_idx + 1, COMPRESSION_RATE).to(tl.int32)
-                child_offsets = tl.arange(0, COMPRESSION_RATE).to(tl.int32)
-                global_pos = rope_pos_start + child_offsets  # [CR]
+                is_rm = parent_idx == rightmost_parent_idx
+                ch_ok = ~is_rm | (o_cr <= rightmost_child_idx)
+                global_pos = rope_pos_start + o_cr
+                child_valid = ch_ok & (global_pos < n_cand)   # [CR]
 
-                child_valid = (child_offsets < num_valid_children) & (global_pos < n_cand)  # [CR]
+                child_rows = child_start + o_cr
+                safe_child_rows = tl.minimum(tl.maximum(child_rows, 0), N_layer - 1).to(tl.int64)
 
-                k_rope_1, k_rope_2 = load_k_with_rope_v2(
-                    layer_k, cos_cache, sin_cache,
-                    i_b, i_h_kv, child_start, rope_pos_start,
-                    N_layer, H_kv, K, COMPRESSION_RATE, num_valid_children
-                )
-                k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [COMPRESSION_RATE, K])  # [CR, K]
+                k_row = k_base + safe_child_rows[:, None] * (H_kv * K)
+                k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
+                k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-                scores_gcr = tl.sum(
-                    q_rope[:, None, :] * k_rope[None, :, :], axis=2
-                )  # [G, CR]
+                rp = (rope_pos_start + o_cr).to(tl.int64)
+                rp = tl.maximum(rp, 0)
+                ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+                sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+                kr1 = k1 * ck - k2 * sk   # [CR, K//2]
+                kr2 = k1 * sk + k2 * ck   # [CR, K//2]
 
-                scores_for_exp = tl.where(child_valid[None, :], scores_gcr, NEG_INF)
-                local_m = tl.max(scores_for_exp, axis=1)  # [G]
-                local_m = tl.max(tl.reshape(local_m, [1, NUM_GROUPS]), axis=1)  # [1]
+                # Split tl.dot: [G_PAD, K//2] × [K//2, CR] → [G_PAD, CR]
+                scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
+                scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
+
+                local_m = tl.max(scores)
                 batch_m = tl.maximum(batch_m, local_m)
 
-                # Shared importance before normalization:
-                #   imp_i = sum_g exp(score_{g,i} - M)
-                # with M maintained online across batches for numerical stability.
-                p = tl.exp(scores_for_exp - sel_m)
-                p = tl.where(child_valid[None, :], p, 0.0)
+                p = tl.exp(scores - sel_m)
+                p = tl.where(child_valid[None, :] & g_valid[:, None], p, 0.0)
                 imp_cr = tl.sum(p, axis=0)  # [CR]
                 imp_cr = tl.where(child_valid, imp_cr, NEG_INF)
 
                 is_row = (tl.arange(0, PARENTS_PER_BATCH) == i_p)[:, None]
                 imp_2d = tl.where(is_row, imp_cr[None, :], imp_2d)
 
-        imp_flat = tl.reshape(imp_2d, [BC])  # [TOP_K]
+        # ---- Phase 2: Top-K merge sort (unchanged) ----
+        imp_flat = tl.reshape(imp_2d, [BC])
         buf_off = (i_batch * BC).to(tl.int32)
-        pos = buf_off + tl.arange(0, BC).to(tl.int32)  # global buffer pos in [0, MAX_CANDIDATES)
+        pos = buf_off + tl.arange(0, BC).to(tl.int32)
         valid_pos = pos < n_cand
         imp_flat = tl.where(valid_pos, imp_flat, NEG_INF)
 
-        # If current batch raises the running max, rescale previous and current
-        # importance into the same normalization frame.
         sel_m_new = tl.maximum(sel_m, batch_m)
         rescale = tl.exp(sel_m - sel_m_new)
 
@@ -716,121 +687,98 @@ def htree_select_accumulate_gqa_kernel(
         running_topk_encoded = run_rescaled_encoded.to(tl.float32, bitcast=True)
 
         imp_flat = tl.where(imp_flat >= 0, imp_flat * rescale, imp_flat)
-        # Keep rightmost causal position in Top-K deterministically.
         imp_flat = tl.where(pos == rightmost_pos, 1e6, imp_flat)
         sel_m = sel_m_new
 
-        # Bit-pack buffer position for stable sorting
         imp_int = imp_flat.to(tl.int32, bitcast=True)
         encoded_idx = tl.where(imp_flat >= 0, ~pos, pos) & idx_mask
         encoded_int = (imp_int & ~idx_mask) | encoded_idx
-        batch_encoded = encoded_int.to(tl.float32, bitcast=True)  # [TOP_K]
+        batch_encoded = encoded_int.to(tl.float32, bitcast=True)
 
-        # Merge current running Top-K with this batch, sort 2*TOP_K, keep top half.
         running_b = tl.broadcast_to(running_topk_encoded[None, :], [2, TOP_K])
         batch_b = tl.broadcast_to(batch_encoded[None, :], [2, TOP_K])
         row_idx = tl.arange(0, 2)[:, None]
         merged_2d = tl.where(row_idx == 0, running_b, batch_b)
         merged_input = tl.reshape(merged_2d, [2 * TOP_K])
 
-        N_DIMS_MERGE: tl.constexpr = N_DIMS_TOPK + 1  # log2(2*TOP_K)
+        N_DIMS_MERGE: tl.constexpr = N_DIMS_TOPK + 1
         sorted_merged = tl.sort(merged_input, descending=True)
         merged_sorted_2d = tl.reshape(sorted_merged, [2, TOP_K])
 
-        # Row 0: new running Top-K; Row 1: dropped candidates (guaranteed non-TopK)
         running_topk_encoded = tl.sum(tl.where(row_idx == 0, merged_sorted_2d, 0.0), axis=0)
         dropped_encoded = tl.sum(tl.where(row_idx == 1, merged_sorted_2d, 0.0), axis=0)
 
-        # Decode dropped buffer positions
         drop_int = dropped_encoded.to(tl.int32, bitcast=True)
         raw_idx = drop_int & idx_mask
         clean_int = drop_int & ~idx_mask
-        clean_imp = clean_int.to(tl.float32, bitcast=True)  # importance with low bits cleared
+        clean_imp = clean_int.to(tl.float32, bitcast=True)
         drop_pos = tl.where(clean_imp >= 0, ~raw_idx, raw_idx)
         drop_pos = (drop_pos & idx_mask).to(tl.int32)
         drop_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (drop_pos < n_cand)
 
-        # Accumulate dropped candidates in blocks.
-        #
-        # NOTE: Triton does not support direct tensor indexing like x[blk, :].
-        # We extract each row via a broadcasted mask + reduction, similar to how
-        # we extract row0/row1 in the Top-K merge above.
+        # ---- Phase 3: accumulate dropped via tl.dot ----
         drop_pos_2d = tl.reshape(drop_pos, [N_DROP_BLOCKS, DROP_BLOCK]).to(tl.int32)
         drop_valid_2d_i32 = tl.reshape(drop_valid.to(tl.int32), [N_DROP_BLOCKS, DROP_BLOCK])
-        block_ids = tl.arange(0, N_DROP_BLOCKS)[:, None]  # [N_DROP_BLOCKS, 1]
+        block_ids = tl.arange(0, N_DROP_BLOCKS)[:, None]
 
         for blk in range(N_DROP_BLOCKS):
-            row_mask = block_ids == blk  # [N_DROP_BLOCKS, 1]
-            pos_blk = tl.sum(tl.where(row_mask, drop_pos_2d, 0), axis=0).to(tl.int32)  # [DROP_BLOCK]
+            row_mask = block_ids == blk
+            pos_blk = tl.sum(tl.where(row_mask, drop_pos_2d, 0), axis=0).to(tl.int32)
             valid_blk_i32 = tl.sum(tl.where(row_mask, drop_valid_2d_i32, 0), axis=0).to(tl.int32)
             valid_blk = valid_blk_i32 > 0
 
-            parent_off = (pos_blk // COMPRESSION_RATE).to(tl.int32)
-            child_slot = (pos_blk - parent_off * COMPRESSION_RATE).to(tl.int32)
-            parent_idx = tl.load(
-                prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
-                mask=valid_blk,
-                other=-1,
+            parent_off_d = (pos_blk // COMPRESSION_RATE).to(tl.int32)
+            child_slot = (pos_blk - parent_off_d * COMPRESSION_RATE).to(tl.int32)
+            safe_poff_d = tl.minimum(tl.maximum(parent_off_d, 0), TOP_K - 1).to(tl.int64)
+            parent_idx_d = tl.load(
+                prev_selected_parents + prev_sel_base + safe_poff_d
             ).to(tl.int32)
 
-            # Validity (defensive)
-            is_rightmost_parent = parent_idx == rightmost_parent_idx
-            child_ok = (~is_rightmost_parent) | (child_slot <= rightmost_child_idx)
-            node_idx = parent_idx * COMPRESSION_RATE + child_slot  # [DROP_BLOCK]
-            node_valid = valid_blk & (parent_idx >= 0) & child_ok & (node_idx >= 0) & (node_idx < N_layer)
+            is_rm_d = parent_idx_d == rightmost_parent_idx
+            child_ok_d = (~is_rm_d) | (child_slot <= rightmost_child_idx)
+            node_idx = tl.maximum(parent_idx_d, 0) * COMPRESSION_RATE + child_slot
+            node_valid = valid_blk & (parent_idx_d >= 0) & child_ok_d & (node_idx >= 0) & (node_idx < N_layer)
 
-            # Load K and apply RoPE for each dropped candidate (rope pos == buffer pos)
-            pos_i64 = pos_blk.to(tl.int64)
-            cos_ptrs = cos_cache + pos_i64[:, None] * (K // 2) + o_k_half[None, :]
-            sin_ptrs = sin_cache + pos_i64[:, None] * (K // 2) + o_k_half[None, :]
-            cos_k = tl.load(cos_ptrs, mask=node_valid[:, None], other=0.0)
-            sin_k = tl.load(sin_ptrs, mask=node_valid[:, None], other=0.0)
+            safe_node = tl.minimum(tl.maximum(node_idx, 0), N_layer - 1).to(tl.int64)
+            safe_pos_d = tl.maximum(pos_blk, 0).to(tl.int64)
 
-            node_i64 = node_idx.to(tl.int64)
-            k_row_stride = H_kv * K
-            k_ptrs1 = k_base + node_i64[:, None] * k_row_stride + o_k_half[None, :]
-            k_ptrs2 = k_base + node_i64[:, None] * k_row_stride + (K // 2) + o_k_half[None, :]
-            k1 = tl.load(k_ptrs1, mask=node_valid[:, None], other=0.0).to(tl.float32)
-            k2 = tl.load(k_ptrs2, mask=node_valid[:, None], other=0.0).to(tl.float32)
-            k_rope_1 = k1 * cos_k - k2 * sin_k
-            k_rope_2 = k1 * sin_k + k2 * cos_k
-            k_rope = tl.reshape(tl.join(k_rope_1, k_rope_2), [DROP_BLOCK, K])  # [DROP_BLOCK, K]
+            k_row_d = k_base + safe_node[:, None] * (H_kv * K)
+            k1d = tl.load(k_row_d + o_k_half[None, :]).to(tl.float32)
+            k2d = tl.load(k_row_d + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-            scores_gb = tl.sum(
-                q_rope[:, None, :] * k_rope[None, :, :], axis=2
-            )  # [G, DROP_BLOCK]
-            scores = tl.trans(scores_gb)  # [DROP_BLOCK, G]
+            ckd = tl.load(cos_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
+            skd = tl.load(sin_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
+            kr1d = k1d * ckd - k2d * skd   # [DROP_BLOCK, K//2]
+            kr2d = k1d * skd + k2d * ckd   # [DROP_BLOCK, K//2]
 
-            # Load V for dropped nodes
-            v_row_stride = H_kv * V
-            v_ptrs = v_base + node_i64[:, None] * v_row_stride + o_v[None, :]
-            v_vals = tl.load(v_ptrs, mask=node_valid[:, None], other=0.0).to(tl.float32)  # [DROP_BLOCK, V]
+            # Split tl.dot: [G_PAD, K//2] × [K//2, DROP_BLOCK] → [G_PAD, DROP_BLOCK]
+            scores_d = tl.dot(q_r1, tl.trans(kr1d)) + tl.dot(q_r2, tl.trans(kr2d))
+            scores_d = tl.where(node_valid[None, :] & g_valid[:, None], scores_d, NEG_INF)
 
-            # Online-softmax merge of this block into (cur_max, cur_sum, cur_output)
-            masked_for_max = tl.where(node_valid[:, None], scores, NEG_INF)
-            batch_max = tl.max(masked_for_max, axis=0)  # [G]
+            v_row_d = v_base + safe_node[:, None] * (H_kv * V)
+            vt = tl.load(v_row_d + o_v[None, :]).to(tl.float32)  # [DROP_BLOCK, V]
 
-            new_max = tl.maximum(cur_max, batch_max)
-            scale_m = tl.exp(cur_max - new_max)
-            cur_sum = cur_sum * scale_m
-            cur_output = cur_output * scale_m[:, None]
+            tile_m = tl.max(scores_d, axis=1)  # [G_PAD]
+            new_max = tl.maximum(cur_max, tile_m)
+            alpha = tl.exp(cur_max - new_max)
+            cur_sum = cur_sum * alpha
+            cur_output = cur_output * alpha[:, None]
 
-            scores_for_exp = tl.where(node_valid[:, None], scores, NEG_INF)
-            p = tl.exp(scores_for_exp - new_max[None, :])
-            p = tl.where(node_valid[:, None], p, 0.0)
+            p = tl.exp(scores_d - new_max[:, None])
+            p = tl.where(node_valid[None, :] & g_valid[:, None], p, 0.0)
+            cur_sum = cur_sum + tl.sum(p, axis=1)
 
-            cur_sum = cur_sum + tl.sum(p, axis=0)
-            dp = tl.sum(p[:, :, None] * v_vals[:, None, :], axis=0)  # [G, V]
-            cur_output = cur_output + dp
+            # PV via tl.dot: [G_PAD, DROP_BLOCK] × [DROP_BLOCK, V] → [G_PAD, V]
+            cur_output = cur_output + tl.dot(p.to(vt.dtype), vt)
             cur_max = new_max
 
-    # Store layer states (merged non-TopK contributions)
-    tl.store(layer_max + state_base + head_ids, cur_max)
-    tl.store(layer_sum + state_base + head_ids, cur_sum)
+    # ---- Store layer states (first NUM_GROUPS heads only) ----
+    tl.store(layer_max + state_base + head_ids, cur_max, mask=g_valid)
+    tl.store(layer_sum + state_base + head_ids, cur_sum, mask=g_valid)
     out_ptrs = layer_output + out_base + head_ids[:, None] * V + o_v[None, :]
-    tl.store(out_ptrs, cur_output)
+    tl.store(out_ptrs, cur_output, mask=g_valid[:, None])
 
-    # Decode final Top-K and map to next layer's selected parents (node indices in this layer)
+    # ---- Decode final Top-K → next_selected_parents ----
     topk_int = running_topk_encoded.to(tl.int32, bitcast=True)
     raw_idx = topk_int & idx_mask
     clean_int = topk_int & ~idx_mask
@@ -840,20 +788,19 @@ def htree_select_accumulate_gqa_kernel(
     topk_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (topk_pos < n_cand)
     topk_pos = tl.where(topk_valid, topk_pos, -1).to(tl.int32)
 
-    parent_off = tl.where(topk_pos >= 0, topk_pos // COMPRESSION_RATE, 0).to(tl.int32)
-    child_slot = tl.where(topk_pos >= 0, topk_pos - parent_off * COMPRESSION_RATE, 0).to(tl.int32)
-    parent_idx = tl.load(
-        prev_selected_parents + prev_sel_base + parent_off.to(tl.int64),
+    parent_off_f = tl.where(topk_pos >= 0, topk_pos // COMPRESSION_RATE, 0).to(tl.int32)
+    child_slot_f = tl.where(topk_pos >= 0, topk_pos - parent_off_f * COMPRESSION_RATE, 0).to(tl.int32)
+    parent_idx_f = tl.load(
+        prev_selected_parents + prev_sel_base + parent_off_f.to(tl.int64),
         mask=topk_pos >= 0,
         other=-1,
     ).to(tl.int32)
     selected_node_indices = tl.where(
         topk_pos >= 0,
-        parent_idx * COMPRESSION_RATE + child_slot,
+        parent_idx_f * COMPRESSION_RATE + child_slot_f,
         -1,
     ).to(tl.int32)
 
-    # Sort ascending for next layer
     MAX_IDX: tl.constexpr = 2147483647
     selected_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
     selected_sorted = tl.sort(selected_sorted, descending=False)
@@ -1108,6 +1055,7 @@ def htree_forward_v2(
                 SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
                 NEG_INF=HTREE_SCORE_NEG_INF,
                 DROP_BLOCK=DROP_BLOCK,
+                G_PAD=G_PAD,
                 scale=scale,
             )
 
