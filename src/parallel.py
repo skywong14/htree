@@ -628,6 +628,8 @@ def htree_select_accumulate_gqa_kernel(
     for i_batch in range(num_batches):
         # ---- Phase 1: TILE_P parents per tl.dot tile ----
         imp_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
+        # Per-batch running max used to stabilize exp(scores - m).
+        # NOT use sel_m here (it starts at NEG_INF), otherwise exp overflows and later rescale (≈0) produces NaNs (inf * 0).
         batch_m = tl.full([1], NEG_INF, dtype=tl.float32)
         batch_parent_base = (i_batch * PARENTS_PER_BATCH).to(tl.int32)
 
@@ -668,10 +670,15 @@ def htree_select_accumulate_gqa_kernel(
             scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
             scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
 
+            # Update per-batch running max and rescale previously written importance.
             local_m = tl.max(scores)
-            batch_m = tl.maximum(batch_m, local_m)
+            new_batch_m = tl.maximum(batch_m, local_m)
+            rescale_batch_old = tl.exp(batch_m - new_batch_m)
+            imp_2d = tl.where(imp_2d >= 0, imp_2d * rescale_batch_old, imp_2d)
+            batch_m = new_batch_m
 
-            p = tl.exp(scores - sel_m)
+            # Importance: sum_g exp(score_g - batch_m). This stays finite (<= G_PAD).
+            p = tl.exp(scores - batch_m)
             p = tl.where(child_valid[None, :] & g_valid[:, None], p, 0.0)
             imp_tile = tl.sum(p, axis=0)  # [TILE_N]
             imp_tile = tl.where(child_valid, imp_tile, NEG_INF)
@@ -693,19 +700,23 @@ def htree_select_accumulate_gqa_kernel(
         valid_pos = pos < n_cand
         imp_flat = tl.where(valid_pos, imp_flat, NEG_INF)
 
+        # Rescale (running_topk, batch_importance) into a common max reference sel_m_new.
+        # - running_topk is already in the previous reference sel_m
+        # - current batch importance is in reference batch_m
         sel_m_new = tl.maximum(sel_m, batch_m)
-        rescale = tl.exp(sel_m - sel_m_new)
+        rescale_run = tl.exp(sel_m - sel_m_new)
+        rescale_batch = tl.exp(batch_m - sel_m_new)
 
         run_int = running_topk_encoded.to(tl.int32, bitcast=True)
         run_raw_idx = run_int & idx_mask
         run_clean_int = run_int & ~idx_mask
         run_clean_imp = run_clean_int.to(tl.float32, bitcast=True)
-        run_rescaled_imp = tl.where(run_clean_imp >= 0, run_clean_imp * rescale, run_clean_imp)
+        run_rescaled_imp = tl.where(run_clean_imp >= 0, run_clean_imp * rescale_run, run_clean_imp)
         run_rescaled_int = run_rescaled_imp.to(tl.int32, bitcast=True)
         run_rescaled_encoded = (run_rescaled_int & ~idx_mask) | run_raw_idx
         running_topk_encoded = run_rescaled_encoded.to(tl.float32, bitcast=True)
 
-        imp_flat = tl.where(imp_flat >= 0, imp_flat * rescale, imp_flat)
+        imp_flat = tl.where(imp_flat >= 0, imp_flat * rescale_batch, imp_flat)
         imp_flat = tl.where(pos == rightmost_pos, 1e6, imp_flat)
         sel_m = sel_m_new
 
