@@ -15,7 +15,7 @@ from typing import Callable, Tuple
 
 import torch
 
-from src.parallel import htree_forward_v2
+from src.parallel import htree_forward
 
 _USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 def _c(text: str, code: str) -> str:
@@ -135,7 +135,7 @@ def run_benchmarks(args: argparse.Namespace) -> None:
     g_cmp = torch.zeros(args.batch, args.seq_len, args.hq, device=device, dtype=dtype)
 
     def run_htree():
-        return htree_forward_v2(
+        return htree_forward(
             q, k, v,
             compression_rate=args.htree_compression_rate,
             max_top_nodes=args.htree_max_top_nodes,

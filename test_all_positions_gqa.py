@@ -1,6 +1,6 @@
 """全位置正确性对比（GQA）。
 
-- Triton: src/parallel.py (htree_forward_v2)
+- Triton: src/parallel.py (htree_forward)
 - Naive : src/naive_gqa.py (forward_kernel)
 
 两边都使用 stable Top-K（Bit-Packing）以提高确定性与对齐度。
@@ -9,7 +9,7 @@
 import sys
 import argparse
 import torch
-from src.parallel import htree_forward_v2
+from src.parallel import htree_forward
 from src.naive_gqa import forward_kernel as naive_forward
 
 
@@ -39,13 +39,14 @@ def _warmup_triton(
     print(f"\n[Warmup] 预热 Triton kernel: {warmup_iters} 次 ...")
     with torch.no_grad():
         for i in range(warmup_iters):
-            _ = htree_forward_v2(
+            _ = htree_forward(
                 q, k, v,
                 compression_rate=compression_rate,
                 max_top_nodes=max_top_nodes,
                 top_k_per_layer=top_k_per_layer,
                 scale=scale,
             )
+            
             _cuda_sync_if_needed(device)
             print(f"[Warmup] 完成 {i + 1}/{warmup_iters}")
     print("[Warmup] Triton 预热完成。\n")
@@ -133,7 +134,7 @@ def test_all_positions(*, warmup_triton_iters: int = 2, compare_naive: bool = Tr
     print("运行 Triton htree (src/parallel.py) ...")
     try:
         _cuda_sync_if_needed(device)
-        output_triton = htree_forward_v2(
+        output_triton = htree_forward(
             q, k, v,
             compression_rate=compression_rate,
             max_top_nodes=max_top_nodes,
@@ -322,7 +323,7 @@ if __name__ == "__main__":
             "--warmup-triton-iters",
             type=int,
             default=2,
-            help="Warm up triton kernels by running htree_forward_v2 N times before the real run (default: 2).",
+            help="Warm up triton kernels by running htree_forward N times before the real run (default: 2).",
         )
         parser.add_argument(
             "--no-compare",

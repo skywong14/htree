@@ -4,8 +4,8 @@ htree Triton Kernel
 
 Pipeline
   Phase 1: Tree Building
-    - Kernel 1: `htree_build_kernel_v2`
-      · 对 (K,V) 逐层 mean pooling, 构建从底层到顶层的 (layers_k, layers_v)
+        - Kernel (build): `htree_build_kernel`
+            · 对 (K,V) 逐层 mean pooling，构建自底向上的 (layers_k, layers_v)
 
   Phase 1.5: RoPE Cache
     - 在 host 侧预计算 `cos_cache/sin_cache` (供所有层复用)
@@ -17,20 +17,20 @@ Pipeline
       · `next_selected_parents`: [B, T, H_kv, TOP_K] —— 当前层 shared Top-K 对应的 node indices (升序, -1 padding)
 
   Phase 3: Layer-by-layer Forward (top → bottom)
-    - Kernel 2.2a `htree_bottom_accumulate_gqa_kernel`
+        - Kernel 1a `htree_bottom_accumulate_gqa_kernel`
       · 底层：不做 Top-K，直接对全部候选做 online-softmax 累积
       · 输出当前层的 `(layer_max, layer_sum, layer_output)`
 
-    - Kernel 2.2b `htree_select_accumulate_gqa_kernel`
+        - Kernel 1b `htree_select_accumulate_gqa_kernel`
       · 非底层：采用 online running-max 的 group-shared 重要度做 streaming Top-K（每次 merge 2*TOP_K 做 bitonic sort），
         同时将被淘汰的一半候选立即做 online-softmax 累积并丢弃（避免存 all_scores，避免额外重读 V）
       · 输出当前层的 `(layer_max, layer_sum, layer_output)`，以及下一层用的 `next_selected_parents`
 
-    - Kernel 2.3 `htree_merge_to_global_kernel_v2`
+        - Kernel 2 `htree_merge_to_global_kernel`
       · online-softmax 合并: 把当前层 `(layer_max, layer_sum, layer_output)` 合并到全局状态
 
   Phase 4: Final Normalize
-    - Kernel `htree_final_normalize_kernel_v2`
+        - Kernel 3 `htree_final_normalize_kernel`
       · `output = global_output / global_sum`
 """
 
@@ -56,11 +56,11 @@ HTREE_SCORE_NEG_INF: float = -1.0e10
 HTREE_SCORE_VALID_THRESHOLD: float = HTREE_SCORE_NEG_INF * 0.9
 
 # ==========================================
-# Kernel 1: Tree Building
+# Kernel (build): Tree Building
 # ==========================================
 
 @triton.jit
-def htree_build_kernel_v2(
+def htree_build_kernel(
     child_k,  # [B, N_child, H_kv, K]
     child_v,  # [B, N_child, H_kv, V]
     parent_k,  # [B, N_parent, H_kv, K]
@@ -161,7 +161,7 @@ def htree_build_kernel_v2(
 # ==========================================
 
 @triton.jit
-def load_k_with_rope_v2(
+def load_k_with_rope(
     layer_k,
     cos_cache,
     sin_cache,
@@ -217,11 +217,11 @@ def load_k_with_rope_v2(
 
 
 # ==========================================
-# Kernel 2.3 & Final Normalization
+# Kernel 2: Merge to Global  /  Kernel 3: Final Normalize
 # ==========================================
 
 @triton.jit
-def htree_merge_to_global_kernel_v2(
+def htree_merge_to_global_kernel(
     layer_max,  # [B, T, H]
     layer_sum,  # [B, T, H]
     layer_output,  # [B, T, H, V]
@@ -233,7 +233,7 @@ def htree_merge_to_global_kernel_v2(
     H: tl.constexpr,
     V: tl.constexpr,
 ):
-    """Kernel 2.3: 全局状态合并, Grid: (T, B*H)"""
+    """Kernel 2: 全局状态合并, Grid: (T, B*H)"""
     i_t = tl.program_id(0)
     i_bh = tl.program_id(1)
     i_b = i_bh // H
@@ -294,7 +294,7 @@ def htree_merge_to_global_kernel_v2(
 
 
 @triton.jit
-def htree_final_normalize_kernel_v2(
+def htree_final_normalize_kernel(
     global_output,  # [B, T, H, V]
     global_sum,  # [B, T, H]
     output,  # [B, T, H, V]
@@ -338,7 +338,7 @@ def htree_final_normalize_kernel_v2(
     tl.store(out_ptrs, normalized, mask=o_v < V)
 
 # ==========================================
-# Kernel 2.2a: Bottom Layer Accumulate (GQA)
+# Kernel 1a: Bottom Accumulate (GQA)
 # ==========================================
 
 @triton.jit
@@ -506,7 +506,7 @@ def htree_bottom_accumulate_gqa_kernel(
 
 
 # ==========================================
-# Kernel 2.2b: Non-Bottom Select + Accumulate (GQA)
+# Kernel 1b: Non-Bottom Select + Accumulate (GQA)
 # ==========================================
 
 @triton.jit
@@ -846,7 +846,7 @@ def htree_select_accumulate_gqa_kernel(
 # Main Forward Function
 # ==========================================
 
-def htree_forward_v2(
+def htree_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -857,7 +857,7 @@ def htree_forward_v2(
     rope_base: float = 10000.0,
 ) -> torch.Tensor:
     """
-    htree 前向传播 V2 (支持 Group Query Attention)
+    htree Forward
     
     Args:
         q: [B, T, H, K] - Query, H 个头
@@ -871,11 +871,6 @@ def htree_forward_v2(
     
     Returns:
         output: [B, T, H, V]
-    
-    Note:
-    - 当 H_kv == H 时, 等价于 Multi-Head Attention (MHA)
-    - 当 H_kv == 1 时, 等价于 Multi-Query Attention (MQA)
-    - 当 1 < H_kv < H 时, 为 Group Query Attention (GQA)
     """
     B, T, H, K = q.shape
     H_kv = k.shape[2]  # KV 头数量
@@ -943,7 +938,7 @@ def htree_forward_v2(
         end_build = torch.cuda.Event(enable_timing=True)
         start_build.record()
 
-        htree_build_kernel_v2[grid](
+        htree_build_kernel[grid](
             current_k, current_v, next_k, next_v,
             N_child=current_len,
             N_parent=next_len,
@@ -1038,8 +1033,8 @@ def htree_forward_v2(
         
         grid = (T, B * H)
 
-        # Kernel 2.2: Select+Accumulate (dispatch bottom vs non-bottom)
-        nvtx.range_push("K2.2_SelectAccumulate")
+        # Kernel 1: Select+Accumulate (dispatch bottom vs non-bottom)
+        nvtx.range_push("K1_SelectAccumulate")
         torch.cuda.synchronize()
         start_k22 = torch.cuda.Event(enable_timing=True)
         end_k22 = torch.cuda.Event(enable_timing=True)
@@ -1047,7 +1042,7 @@ def htree_forward_v2(
 
         grid_kv = (T, B * H_kv)
         if is_bottom_layer:
-            print("    Running bottom accumulate kernel (K2.2a)...")
+            print("    Running bottom accumulate kernel (Kernel 1a)...")
             htree_bottom_accumulate_gqa_kernel[grid_kv](
                 q, k_layer, v_layer,
                 prev_selected_parents,
@@ -1065,7 +1060,7 @@ def htree_forward_v2(
                 scale=scale,
             )
         else:
-            print("    Running select+accumulate kernel (K2.2b)...")
+            print("    Running select+accumulate kernel (Kernel 1b)...")
             htree_select_accumulate_gqa_kernel[grid_kv](
                 q, k_layer, v_layer,
                 prev_selected_parents,
@@ -1091,19 +1086,19 @@ def htree_forward_v2(
         end_k22.record()
         torch.cuda.synchronize()
         time_k22 = start_k22.elapsed_time(end_k22)
-        print(f"      Kernel 2.2 time: {time_k22:.2f} ms")
+        print(f"      Kernel 1 time: {time_k22:.2f} ms")
         nvtx.range_pop()
         
-        # Kernel 2.3: Merge to Global State
-        nvtx.range_push("K2.3_MergeToGlobal")
-        print("    Running merge to global kernel...")
+        # Kernel 2: Merge to Global State
+        nvtx.range_push("K2_MergeToGlobal")
+        print("    Running merge to global kernel (Kernel 2)...")
         
         torch.cuda.synchronize()
         start_k23 = torch.cuda.Event(enable_timing=True)
         end_k23 = torch.cuda.Event(enable_timing=True)
         start_k23.record()
         
-        htree_merge_to_global_kernel_v2[grid](
+        htree_merge_to_global_kernel[grid](
             layer_max, layer_sum, layer_output,
             global_max, global_sum, global_output,
             B=B, T=T, H=H, V=V,
@@ -1111,7 +1106,7 @@ def htree_forward_v2(
         end_k23.record()
         torch.cuda.synchronize()
         time_k23 = start_k23.elapsed_time(end_k23)
-        print(f"      Kernel 2.3 time: {time_k23:.2f} ms")
+        print(f"      Kernel 2 time: {time_k23:.2f} ms")
         
         nvtx.range_pop()
 
@@ -1134,28 +1129,27 @@ def htree_forward_v2(
     end_k4 = torch.cuda.Event(enable_timing=True)
     start_k4.record()
     
-    htree_final_normalize_kernel_v2[grid](
+    htree_final_normalize_kernel[grid](
         global_output, global_sum, output,
         B=B, T=T, H=H, V=V,
     )
     end_k4.record()
     torch.cuda.synchronize()
     time_k4 = start_k4.elapsed_time(end_k4)
-    print(f"  Final Normalization Kernel time: {time_k4:.2f} ms")
+    print(f"  Kernel 3 time (final normalize): {time_k4:.2f} ms")
     
     nvtx.range_pop()
 
-    print("htree forward pass V2 completed!")
+    print("htree forward pass completed!")
     
     return output
 
 
 __all__ = [
-    'htree_forward_v2',
-    'htree_build_kernel_v2',
-    'htree_compute_lse_gqa_kernel',
+    'htree_forward',
+    'htree_build_kernel',
     'htree_bottom_accumulate_gqa_kernel',
     'htree_select_accumulate_gqa_kernel',
-    'htree_merge_to_global_kernel_v2',
-    'htree_final_normalize_kernel_v2',
+    'htree_merge_to_global_kernel',
+    'htree_final_normalize_kernel',
 ]
