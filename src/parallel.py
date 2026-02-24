@@ -539,6 +539,7 @@ def htree_select_accumulate_gqa_kernel(
     NEG_INF: tl.constexpr,
     DROP_BLOCK: tl.constexpr,
     G_PAD: tl.constexpr,
+    TILE_P: tl.constexpr,
     scale,
 ):
     """Non-bottom layer forward: streaming Top-K + accumulate dropped.
@@ -614,58 +615,74 @@ def htree_select_accumulate_gqa_kernel(
     v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
 
     N_DROP_BLOCKS: tl.constexpr = TOP_K // DROP_BLOCK
-    o_cr = tl.arange(0, COMPRESSION_RATE).to(tl.int32)
+    TILE_N: tl.constexpr = TILE_P * COMPRESSION_RATE
+    PARENT_TILES: tl.constexpr = (PARENTS_PER_BATCH + TILE_P - 1) // TILE_P
+    o_n = tl.arange(0, TILE_N).to(tl.int32)
+    parent_in_tile = o_n // COMPRESSION_RATE
+    child_in_tile = o_n % COMPRESSION_RATE
+    batch_rows = tl.arange(0, PARENTS_PER_BATCH).to(tl.int32)
+    tile_rows = tl.arange(0, TILE_P).to(tl.int32)
 
     for i_batch in range(num_batches):
-        # ---- Phase 1: per-parent importance via tl.dot ----
+        # ---- Phase 1: TILE_P parents per tl.dot tile ----
         imp_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
         batch_m = tl.full([1], NEG_INF, dtype=tl.float32)
+        batch_parent_base = (i_batch * PARENTS_PER_BATCH).to(tl.int32)
 
-        for i_p in range(PARENTS_PER_BATCH):
-            parent_off = (i_batch * PARENTS_PER_BATCH + i_p).to(tl.int32)
-            safe_poff = tl.minimum(parent_off, TOP_K - 1).to(tl.int64)
+        for i_tile in range(PARENT_TILES):
+            tile_base = (i_tile * TILE_P).to(tl.int32)
+            parent_off_local = tile_base + parent_in_tile
+            parent_off = batch_parent_base + parent_off_local
+
+            safe_poff = tl.minimum(tl.maximum(parent_off, 0), TOP_K - 1).to(tl.int64)
             parent_idx = tl.load(
                 prev_selected_parents + prev_sel_base + safe_poff
             ).to(tl.int32)
-            poff_valid = parent_off < TOP_K
 
-            if parent_idx >= 0 and poff_valid:
-                child_start = parent_idx * COMPRESSION_RATE
-                rope_pos_start = parent_off * COMPRESSION_RATE
+            poff_valid = (
+                (parent_off_local < PARENTS_PER_BATCH)
+                & (parent_off < num_valid_parents)
+                & (parent_off < TOP_K)
+                & (parent_idx >= 0)
+            )
+            is_rm = parent_idx == rightmost_parent_idx
+            ch_ok = ~is_rm | (child_in_tile <= rightmost_child_idx)
+            child_rows = tl.maximum(parent_idx, 0) * COMPRESSION_RATE + child_in_tile
+            child_valid = poff_valid & ch_ok & (child_rows >= 0) & (child_rows < N_layer)
 
-                is_rm = parent_idx == rightmost_parent_idx
-                ch_ok = ~is_rm | (o_cr <= rightmost_child_idx)
-                global_pos = rope_pos_start + o_cr
-                child_valid = ch_ok & (global_pos < n_cand)   # [CR]
+            safe_child_rows = tl.minimum(tl.maximum(child_rows, 0), N_layer - 1).to(tl.int64)
+            k_row = k_base + safe_child_rows[:, None] * (H_kv * K)
+            k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
+            k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-                child_rows = child_start + o_cr
-                safe_child_rows = tl.minimum(tl.maximum(child_rows, 0), N_layer - 1).to(tl.int64)
+            rp = parent_off.to(tl.int64) * COMPRESSION_RATE + child_in_tile.to(tl.int64)
+            rp = tl.maximum(rp, 0)
+            ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+            sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
+            kr1 = k1 * ck - k2 * sk   # [TILE_N, K//2]
+            kr2 = k1 * sk + k2 * ck   # [TILE_N, K//2]
 
-                k_row = k_base + safe_child_rows[:, None] * (H_kv * K)
-                k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
-                k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
+            # Split tl.dot: [G_PAD, K//2] × [K//2, TILE_N] → [G_PAD, TILE_N]
+            scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
+            scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
 
-                rp = (rope_pos_start + o_cr).to(tl.int64)
-                rp = tl.maximum(rp, 0)
-                ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-                sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-                kr1 = k1 * ck - k2 * sk   # [CR, K//2]
-                kr2 = k1 * sk + k2 * ck   # [CR, K//2]
+            local_m = tl.max(scores)
+            batch_m = tl.maximum(batch_m, local_m)
 
-                # Split tl.dot: [G_PAD, K//2] × [K//2, CR] → [G_PAD, CR]
-                scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
-                scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
+            p = tl.exp(scores - sel_m)
+            p = tl.where(child_valid[None, :] & g_valid[:, None], p, 0.0)
+            imp_tile = tl.sum(p, axis=0)  # [TILE_N]
+            imp_tile = tl.where(child_valid, imp_tile, NEG_INF)
+            imp_tile_2d = tl.reshape(imp_tile, [TILE_P, COMPRESSION_RATE])
 
-                local_m = tl.max(scores)
-                batch_m = tl.maximum(batch_m, local_m)
-
-                p = tl.exp(scores - sel_m)
-                p = tl.where(child_valid[None, :] & g_valid[:, None], p, 0.0)
-                imp_cr = tl.sum(p, axis=0)  # [CR]
-                imp_cr = tl.where(child_valid, imp_cr, NEG_INF)
-
-                is_row = (tl.arange(0, PARENTS_PER_BATCH) == i_p)[:, None]
-                imp_2d = tl.where(is_row, imp_cr[None, :], imp_2d)
+            # Write tiled importance back to [PARENTS_PER_BATCH, CR]
+            for i_r in range(TILE_P):
+                row_off = (tile_base + i_r).to(tl.int32)
+                row_mask_in_tile = (tile_rows == i_r)[:, None]
+                row_vals = tl.sum(tl.where(row_mask_in_tile, imp_tile_2d, 0.0), axis=0)
+                row_vals = tl.where(row_off < PARENTS_PER_BATCH, row_vals, NEG_INF)
+                is_row = (batch_rows == row_off)[:, None]
+                imp_2d = tl.where(is_row, row_vals[None, :], imp_2d)
 
         # ---- Phase 2: Top-K merge sort (unchanged) ----
         imp_flat = tl.reshape(imp_2d, [BC])
@@ -1056,6 +1073,7 @@ def htree_forward_v2(
                 NEG_INF=HTREE_SCORE_NEG_INF,
                 DROP_BLOCK=DROP_BLOCK,
                 G_PAD=G_PAD,
+                TILE_P=TILE_P,
                 scale=scale,
             )
 
