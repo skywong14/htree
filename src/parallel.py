@@ -622,6 +622,8 @@ def htree_select_accumulate_gqa_kernel(
     child_in_tile = o_n % COMPRESSION_RATE
     batch_rows = tl.arange(0, PARENTS_PER_BATCH).to(tl.int32)
     tile_rows = tl.arange(0, TILE_P).to(tl.int32)
+    row_idx = tl.arange(0, 2)[:, None]
+    block_ids = tl.arange(0, N_DROP_BLOCKS)[:, None]
 
     for i_batch in range(num_batches):
         # ---- Phase 1: TILE_P parents per tl.dot tile ----
@@ -675,7 +677,7 @@ def htree_select_accumulate_gqa_kernel(
             imp_tile = tl.where(child_valid, imp_tile, NEG_INF)
             imp_tile_2d = tl.reshape(imp_tile, [TILE_P, COMPRESSION_RATE])
 
-            # Write tiled importance back to [PARENTS_PER_BATCH, CR]
+            # TODO Write tiled importance back to [PARENTS_PER_BATCH, CR]
             for i_r in range(TILE_P):
                 row_off = (tile_base + i_r).to(tl.int32)
                 row_mask_in_tile = (tile_rows == i_r)[:, None]
@@ -714,7 +716,6 @@ def htree_select_accumulate_gqa_kernel(
 
         running_b = tl.broadcast_to(running_topk_encoded[None, :], [2, TOP_K])
         batch_b = tl.broadcast_to(batch_encoded[None, :], [2, TOP_K])
-        row_idx = tl.arange(0, 2)[:, None]
         merged_2d = tl.where(row_idx == 0, running_b, batch_b)
         merged_input = tl.reshape(merged_2d, [2 * TOP_K])
 
@@ -736,7 +737,6 @@ def htree_select_accumulate_gqa_kernel(
         # ---- Phase 3: accumulate dropped via tl.dot ----
         drop_pos_2d = tl.reshape(drop_pos, [N_DROP_BLOCKS, DROP_BLOCK]).to(tl.int32)
         drop_valid_2d_i32 = tl.reshape(drop_valid.to(tl.int32), [N_DROP_BLOCKS, DROP_BLOCK])
-        block_ids = tl.arange(0, N_DROP_BLOCKS)[:, None]
 
         for blk in range(N_DROP_BLOCKS):
             row_mask = block_ids == blk
@@ -992,7 +992,7 @@ def htree_forward_v2(
     N_DIMS_TOPK = int(math.log2(top_k_per_layer))
 
     # Dropped candidates are accumulated in blocks for better throughput.
-    DROP_BLOCK = 32
+    DROP_BLOCK = 64
     assert top_k_per_layer % DROP_BLOCK == 0, f"top_k_per_layer ({top_k_per_layer}) must be divisible by DROP_BLOCK ({DROP_BLOCK})"
 
     # Bottom kernel: batch TILE_P parents per iteration; pad G to ≥16 for tl.dot
