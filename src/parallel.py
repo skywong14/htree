@@ -1,63 +1,88 @@
 # -*- coding: utf-8 -*-
 """
-htree Triton Kernel
+HTree Triton Kernels
 
 Pipeline
   Phase 1: Tree Building
-        - Kernel (build): `htree_build_kernel`
-            · 对 (K,V) 逐层 mean pooling，构建自底向上的 (layers_k, layers_v)
+        - Kernel: `htree_build_kernel`
+            - Bottom-up mean-pooling of (K, V) to build `(layers_k, layers_v)`.
 
   Phase 1.5: RoPE Cache
-    - 在 host 侧预计算 `cos_cache/sin_cache` (供所有层复用)
+    - Host-side precomputation of `cos_cache / sin_cache` (shared by all layers).
 
   Phase 2: Init Global State & Workspaces
-    - 初始化全局 online-softmax 状态: `global_max/global_sum/global_output`
-    - 分配每层复用的 workspace:
-      · `prev_selected_parents`: [B, T, H_kv, TOP_K] —— 下一层展开所需的 parent 列表 (升序)
-      · `next_selected_parents`: [B, T, H_kv, TOP_K] —— 当前层 shared Top-K 对应的 node indices (升序, -1 padding)
+    - Zero-init online-softmax accumulators: `global_max / global_sum / global_output`.
+    - Allocate per-layer reusable workspaces:
+      - `prev_selected_parents`: [B, T, H_kv, TOP_K] -- parent list for next-layer expansion (ascending).
+      - `next_selected_parents`: [B, T, H_kv, TOP_K] -- current-layer shared Top-K node indices (ascending, -1 padded).
 
-  Phase 3: Layer-by-layer Forward (top → bottom)
+  Phase 3: Layer-by-layer Forward (top -> bottom)
         - Kernel 1a `htree_bottom_accumulate_gqa_kernel`
-      · 底层：不做 Top-K，直接对全部候选做 online-softmax 累积
-      · 输出当前层的 `(layer_max, layer_sum, layer_output)`
+      - Bottom layer: skip Top-K, accumulate all candidates via online-softmax.
+      - Outputs `(layer_max, layer_sum, layer_output)`.
 
         - Kernel 1b `htree_select_accumulate_gqa_kernel`
-      · 非底层：采用 online running-max 的 group-shared 重要度做 streaming Top-K（每次 merge 2*TOP_K 做 bitonic sort），
-        同时将被淘汰的一半候选立即做 online-softmax 累积并丢弃（避免存 all_scores，避免额外重读 V）
-      · 输出当前层的 `(layer_max, layer_sum, layer_output)`，以及下一层用的 `next_selected_parents`
+      - Non-bottom layers: streaming Top-K via group-shared importance
+        (merge 2*TOP_K with bitonic sort each iteration), immediately
+        accumulating dropped candidates via online-softmax (avoids storing
+        all scores and re-reading V).
+      - Outputs `(layer_max, layer_sum, layer_output)` and `next_selected_parents`.
 
         - Kernel 2 `htree_merge_to_global_kernel`
-      · online-softmax 合并: 把当前层 `(layer_max, layer_sum, layer_output)` 合并到全局状态
+      - Online-softmax merge: fold `(layer_max, layer_sum, layer_output)` into global state.
 
   Phase 4: Final Normalize
         - Kernel 3 `htree_final_normalize_kernel`
-      · `output = global_output / global_sum`
+      - `output = global_output / global_sum`.
 """
 
-from typing import Optional
+import logging
 import math
+from contextlib import contextmanager
+from typing import Optional
+
 import torch
 import torch.cuda.nvtx as nvtx
 import triton
 import triton.language as tl
 
-# ==========================================
-# 全局常量 (数值约定)
-# ==========================================
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
 
-# 作为“负无穷/被屏蔽”的统一 sentinel 分数。
-# 关系: 所有被屏蔽/无效位置的 score 必须 <= HTREE_SCORE_NEG_INF。
+
+@contextmanager
+def _cuda_timer(label: str):
+    """Context manager that times enclosed CUDA ops and logs the result."""
+    torch.cuda.synchronize()
+    t0 = torch.cuda.Event(enable_timing=True)
+    t1 = torch.cuda.Event(enable_timing=True)
+    t0.record()
+    yield
+    t1.record()
+    torch.cuda.synchronize()
+    logger.info("%s: %.2f ms", label, t0.elapsed_time(t1))
+
+# ========================================
+#  Global Constants
+# ========================================
+
+# Unified sentinel score for masked / invalid positions.
+# All masked entries must have score <= HTREE_SCORE_NEG_INF.
 HTREE_SCORE_NEG_INF: float = -1.0e10
 
-# 判定 score 是否“有效”的阈值。
-# 关系: HTREE_SCORE_VALID_THRESHOLD 必须严格大于 HTREE_SCORE_NEG_INF, 
-# 从而能用 `score > HTREE_SCORE_VALID_THRESHOLD` 区分出被屏蔽(-1e10)的项。
-# 这里沿用原实现的经验值: -0.9e10。
+# Threshold for distinguishing valid scores from masked ones.
+# Must be strictly greater than HTREE_SCORE_NEG_INF so that
+# `score > THRESHOLD` filters out masked entries (-1e10).
+# Empirical value from the original implementation: -0.9e10.
 HTREE_SCORE_VALID_THRESHOLD: float = HTREE_SCORE_NEG_INF * 0.9
 
-# ==========================================
-# Kernel (build): Tree Building
-# ==========================================
+# ========================================
+#  Kernel (build): Tree Building
+# ========================================
 
 @triton.jit
 def htree_build_kernel(
@@ -156,9 +181,9 @@ def htree_build_kernel(
     tl.store(parent_v_block_ptrs, v_mean.to(parent_v.dtype.element_ty), boundary_check=(0, 1))
 
 
-# ==========================================
-# 辅助函数
-# ==========================================
+# ========================================
+#  Helper Functions
+# ========================================
 
 @triton.jit
 def load_k_with_rope(
@@ -175,11 +200,11 @@ def load_k_with_rope(
     COMPRESSION_RATE: tl.constexpr,
     num_valid_children,
 ):
-    """加载 16 个 token 的 K 并应用 RoPE 编码"""
+    """Load COMPRESSION_RATE tokens of K and apply RoPE."""
     k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
     
-    # 前半部分
-    k1_block_ptrs = tl.make_block_ptr(
+    # First half of head dim
+    k_lo_ptrs = tl.make_block_ptr(
         base=k_base,
         shape=(N_layer, K),
         strides=(H_kv * K, 1),
@@ -187,10 +212,10 @@ def load_k_with_rope(
         block_shape=(COMPRESSION_RATE, K // 2),
         order=(1, 0)
     )
-    k1 = tl.load(k1_block_ptrs, boundary_check=(0, 1))
+    k_lo = tl.load(k_lo_ptrs, boundary_check=(0, 1))
     
-    # 后半部分
-    k2_block_ptrs = tl.make_block_ptr(
+    # Second half of head dim
+    k_hi_ptrs = tl.make_block_ptr(
         base=k_base,
         shape=(N_layer, K),
         strides=(H_kv * K, 1),
@@ -198,9 +223,9 @@ def load_k_with_rope(
         block_shape=(COMPRESSION_RATE, K // 2),
         order=(1, 0)
     )
-    k2 = tl.load(k2_block_ptrs, boundary_check=(0, 1))
+    k_hi = tl.load(k_hi_ptrs, boundary_check=(0, 1))
     
-    # 应用 RoPE
+    # Apply RoPE rotation
     rope_positions = rope_position_start + tl.arange(0, COMPRESSION_RATE)
     o_k_half = tl.arange(0, K // 2)
     
@@ -210,15 +235,15 @@ def load_k_with_rope(
     cos_k = tl.load(cos_ptrs, mask=valid_rows, other=0.0)
     sin_k = tl.load(sin_ptrs, mask=valid_rows, other=0.0)
     
-    k_rope_1 = k1 * cos_k - k2 * sin_k
-    k_rope_2 = k1 * sin_k + k2 * cos_k
+    k_rope_lo = k_lo * cos_k - k_hi * sin_k
+    k_rope_hi = k_lo * sin_k + k_hi * cos_k
     
-    return k_rope_1, k_rope_2
+    return k_rope_lo, k_rope_hi
 
 
-# ==========================================
-# Kernel 2: Merge to Global  /  Kernel 3: Final Normalize
-# ==========================================
+# ========================================
+#  Kernel 2: Merge to Global  /  Kernel 3: Final Normalize
+# ========================================
 
 @triton.jit
 def htree_merge_to_global_kernel(
@@ -233,7 +258,7 @@ def htree_merge_to_global_kernel(
     H: tl.constexpr,
     V: tl.constexpr,
 ):
-    """Kernel 2: 全局状态合并, Grid: (T, B*H)"""
+    """Kernel 2: merge layer state into global online-softmax accumulators. Grid: (T, B*H)."""
     i_t = tl.program_id(0)
     i_bh = tl.program_id(1)
     i_b = i_bh // H
@@ -337,9 +362,9 @@ def htree_final_normalize_kernel(
     out_ptrs = output + output_offset + o_v
     tl.store(out_ptrs, normalized, mask=o_v < V)
 
-# ==========================================
-# Kernel 1a: Bottom Accumulate (GQA)
-# ==========================================
+# ========================================
+#  Kernel 1a: Bottom Accumulate (GQA)
+# ========================================
 
 @triton.jit
 def htree_bottom_accumulate_gqa_kernel(
@@ -377,9 +402,9 @@ def htree_bottom_accumulate_gqa_kernel(
     Grid: (T, B*H_kv). One program per (b, t, h_kv).
     """
     i_t = tl.program_id(0)
-    i_bhk = tl.program_id(1)
-    i_b = i_bhk // H_kv
-    i_h_kv = i_bhk % H_kv
+    pid_bh_kv = tl.program_id(1)
+    i_b = pid_bh_kv // H_kv
+    i_h_kv = pid_bh_kv % H_kv
 
     rightmost_idx = i_t // layer_power
     rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
@@ -397,8 +422,8 @@ def htree_bottom_accumulate_gqa_kernel(
 
     assert num_valid_parents > 0, "No valid candidates found"
 
-    n_cand = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
-    rope_pos_q = n_cand - 1
+    num_candidates = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
+    rope_pos_q = num_candidates - 1
 
     # ---- Load Q for G_PAD heads (zero-pad when G_PAD > NUM_GROUPS) ----
     g_ids = tl.arange(0, G_PAD).to(tl.int64)
@@ -408,13 +433,13 @@ def htree_bottom_accumulate_gqa_kernel(
     o_k_half = tl.arange(0, K // 2).to(tl.int64)
     q_bt_base = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
     q_ptrs = q + q_bt_base + head_ids[:, None] * K
-    q1 = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
-    q2 = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q_lo = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q_hi = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
 
     cos_q = tl.load(cos_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
     sin_q = tl.load(sin_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
-    q_r1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G_PAD, K//2]
-    q_r2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G_PAD, K//2]
+    q_rope_lo = (q_lo * cos_q[None, :] - q_hi * sin_q[None, :]) * scale  # [G_PAD, K//2]
+    q_rope_hi = (q_lo * sin_q[None, :] + q_hi * cos_q[None, :]) * scale  # [G_PAD, K//2]
 
     # ---- Online-softmax state (G_PAD-wide) ----
     cur_max = tl.full([G_PAD], NEG_INF, dtype=tl.float32)
@@ -439,8 +464,8 @@ def htree_bottom_accumulate_gqa_kernel(
     #  Triton layout conflicts between 1-D masked loads and 2-D tl.dot results.
     #  Validity is enforced purely by masking scores to NEG_INF / probs to 0.
     num_tiles = (num_valid_parents + TILE_P - 1) // TILE_P
-    for _i in range(num_tiles):
-        tile_base = (_i * TILE_P).to(tl.int32)
+    for tile_idx in range(num_tiles):
+        tile_base = (tile_idx * TILE_P).to(tl.int32)
 
         # Global parent offset for each of the TILE_N positions
         p_offs = tile_base + parent_in_tile                               # [TILE_N]
@@ -463,25 +488,25 @@ def htree_bottom_accumulate_gqa_kernel(
 
         # ---- Gather K (two halves, unconditional) ----
         k_row = k_base + safe_rows[:, None] * (H_kv * K)
-        k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)           # [TILE_N, K//2]
-        k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
+        k_lo = tl.load(k_row + o_k_half[None, :]).to(tl.float32)           # [TILE_N, K//2]
+        k_hi = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
         # ---- RoPE on K (flat position = tile_base * CR + o_n, contiguous) ----
-        rp = tile_base.to(tl.int64) * COMPRESSION_RATE + o_n.to(tl.int64)
-        rp = tl.maximum(rp, 0)
-        ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-        sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-        kr1 = k1 * ck - k2 * sk                                          # [TILE_N, K//2]
-        kr2 = k1 * sk + k2 * ck                                          # [TILE_N, K//2]
+        rope_pos = tile_base.to(tl.int64) * COMPRESSION_RATE + o_n.to(tl.int64)
+        rope_pos = tl.maximum(rope_pos, 0)
+        cos_k = tl.load(cos_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+        sin_k = tl.load(sin_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+        k_rope_lo = k_lo * cos_k - k_hi * sin_k                                          # [TILE_N, K//2]
+        k_rope_hi = k_lo * sin_k + k_hi * cos_k                                          # [TILE_N, K//2]
 
         # ---- Scores via split tl.dot ----
         # [G_PAD, K//2] × [K//2, TILE_N]  +  same  →  [G_PAD, TILE_N]
-        scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
+        scores = tl.dot(q_rope_lo, tl.trans(k_rope_lo)) + tl.dot(q_rope_hi, tl.trans(k_rope_hi))
         scores = tl.where(valid[None, :] & g_valid[:, None], scores, NEG_INF)
 
         # ---- Gather V (unconditional) ----
         v_row = v_base + safe_rows[:, None] * (H_kv * V)
-        vt = tl.load(v_row + o_v[None, :]).to(tl.float32)                # [TILE_N, V]
+        v_tile = tl.load(v_row + o_v[None, :]).to(tl.float32)                # [TILE_N, V]
 
         # ---- Online softmax ----
         tile_m = tl.max(scores, axis=1)                                   # [G_PAD]
@@ -490,12 +515,12 @@ def htree_bottom_accumulate_gqa_kernel(
         cur_sum = cur_sum * alpha
         cur_output = cur_output * alpha[:, None]
 
-        p = tl.exp(scores - new_m[:, None])
-        p = tl.where(valid[None, :] & g_valid[:, None], p, 0.0)
-        cur_sum = cur_sum + tl.sum(p, axis=1)
+        attn_probs = tl.exp(scores - new_m[:, None])
+        attn_probs = tl.where(valid[None, :] & g_valid[:, None], attn_probs, 0.0)
+        cur_sum = cur_sum + tl.sum(attn_probs, axis=1)
 
         # ---- PV via tl.dot  [G_PAD, TILE_N] × [TILE_N, V] → [G_PAD, V] ----
-        cur_output = cur_output + tl.dot(p.to(vt.dtype), vt)
+        cur_output = cur_output + tl.dot(attn_probs.to(v_tile.dtype), v_tile)
         cur_max = new_m
 
     # ---- Store (first NUM_GROUPS heads only) ----
@@ -505,9 +530,9 @@ def htree_bottom_accumulate_gqa_kernel(
     tl.store(out_ptrs, cur_output, mask=g_valid[:, None])
 
 
-# ==========================================
-# Kernel 1b: Non-Bottom Select + Accumulate (GQA)
-# ==========================================
+# ========================================
+#  Kernel 1b: Non-Bottom Select + Accumulate (GQA)
+# ========================================
 
 @triton.jit
 def htree_select_accumulate_gqa_kernel(
@@ -549,9 +574,9 @@ def htree_select_accumulate_gqa_kernel(
     Grid: (T, B*H_kv). One program per (b, t, h_kv).
     """
     i_t = tl.program_id(0)
-    i_bhk = tl.program_id(1)
-    i_b = i_bhk // H_kv
-    i_h_kv = i_bhk % H_kv
+    pid_bh_kv = tl.program_id(1)
+    i_b = pid_bh_kv // H_kv
+    i_h_kv = pid_bh_kv % H_kv
 
     rightmost_idx = i_t // layer_power
     rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
@@ -569,8 +594,8 @@ def htree_select_accumulate_gqa_kernel(
 
     assert num_valid_parents > 0, "No valid candidates found"
 
-    n_cand = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
-    rope_pos_q = n_cand - 1
+    num_candidates = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
+    rope_pos_q = num_candidates - 1
 
     # ---- Load Q for G_PAD heads (zero-pad when G_PAD > NUM_GROUPS) ----
     g_ids = tl.arange(0, G_PAD).to(tl.int64)
@@ -580,13 +605,13 @@ def htree_select_accumulate_gqa_kernel(
     o_k_half = tl.arange(0, K // 2).to(tl.int64)
     q_bt_base = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
     q_ptrs = q + q_bt_base + head_ids[:, None] * K
-    q1 = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
-    q2 = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q_lo = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q_hi = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
 
     cos_q = tl.load(cos_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
     sin_q = tl.load(sin_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
-    q_r1 = (q1 * cos_q[None, :] - q2 * sin_q[None, :]) * scale  # [G_PAD, K//2]
-    q_r2 = (q1 * sin_q[None, :] + q2 * cos_q[None, :]) * scale  # [G_PAD, K//2]
+    q_rope_lo = (q_lo * cos_q[None, :] - q_hi * sin_q[None, :]) * scale  # [G_PAD, K//2]
+    q_rope_hi = (q_lo * sin_q[None, :] + q_hi * cos_q[None, :]) * scale  # [G_PAD, K//2]
 
     # ---- Online-softmax state (G_PAD-wide) ----
     cur_max = tl.full([G_PAD], NEG_INF, dtype=tl.float32)
@@ -601,8 +626,8 @@ def htree_select_accumulate_gqa_kernel(
     num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
 
     idx_mask = (1 << LOG_N) - 1
-    rightmost_pos = (n_cand - 1).to(tl.int32)
-    sel_m = tl.full([1], NEG_INF, dtype=tl.float32)
+    rightmost_pos = (num_candidates - 1).to(tl.int32)
+    topk_running_max = tl.full([1], NEG_INF, dtype=tl.float32)
 
     init_idx = tl.arange(0, TOP_K).to(tl.int32)
     init_imp = tl.full([TOP_K], NEG_INF, dtype=tl.float32)
@@ -627,9 +652,9 @@ def htree_select_accumulate_gqa_kernel(
 
     for i_batch in range(num_batches):
         # ---- Phase 1: TILE_P parents per tl.dot tile ----
-        imp_2d = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
+        importance_matrix = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
         # Per-batch running max used to stabilize exp(scores - m).
-        # NOT use sel_m here (it starts at NEG_INF), otherwise exp overflows and later rescale (≈0) produces NaNs (inf * 0).
+        # NOT use topk_running_max here (it starts at NEG_INF), otherwise exp overflows and later rescale (≈0) produces NaNs (inf * 0).
         batch_m = tl.full([1], NEG_INF, dtype=tl.float32)
         batch_parent_base = (i_batch * PARENTS_PER_BATCH).to(tl.int32)
 
@@ -656,55 +681,55 @@ def htree_select_accumulate_gqa_kernel(
 
             safe_child_rows = tl.minimum(tl.maximum(child_rows, 0), N_layer - 1).to(tl.int64)
             k_row = k_base + safe_child_rows[:, None] * (H_kv * K)
-            k1 = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
-            k2 = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
+            k_lo = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
+            k_hi = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-            rp = parent_off.to(tl.int64) * COMPRESSION_RATE + child_in_tile.to(tl.int64)
-            rp = tl.maximum(rp, 0)
-            ck = tl.load(cos_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-            sk = tl.load(sin_cache + rp[:, None] * (K // 2) + o_k_half[None, :])
-            kr1 = k1 * ck - k2 * sk   # [TILE_N, K//2]
-            kr2 = k1 * sk + k2 * ck   # [TILE_N, K//2]
+            rope_pos = parent_off.to(tl.int64) * COMPRESSION_RATE + child_in_tile.to(tl.int64)
+            rope_pos = tl.maximum(rope_pos, 0)
+            cos_k = tl.load(cos_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+            sin_k = tl.load(sin_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+            k_rope_lo = k_lo * cos_k - k_hi * sin_k   # [TILE_N, K//2]
+            k_rope_hi = k_lo * sin_k + k_hi * cos_k   # [TILE_N, K//2]
 
             # Split tl.dot: [G_PAD, K//2] × [K//2, TILE_N] → [G_PAD, TILE_N]
-            scores = tl.dot(q_r1, tl.trans(kr1)) + tl.dot(q_r2, tl.trans(kr2))
+            scores = tl.dot(q_rope_lo, tl.trans(k_rope_lo)) + tl.dot(q_rope_hi, tl.trans(k_rope_hi))
             scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
 
             # Update per-batch running max and rescale previously written importance.
             local_m = tl.max(scores)
             new_batch_m = tl.maximum(batch_m, local_m)
             rescale_batch_old = tl.exp(batch_m - new_batch_m)
-            imp_2d = tl.where(imp_2d >= 0, imp_2d * rescale_batch_old, imp_2d)
+            importance_matrix = tl.where(importance_matrix >= 0, importance_matrix * rescale_batch_old, importance_matrix)
             batch_m = new_batch_m
 
             # Importance: sum_g exp(score_g - batch_m). This stays finite (<= G_PAD).
-            p = tl.exp(scores - batch_m)
-            p = tl.where(child_valid[None, :] & g_valid[:, None], p, 0.0)
-            imp_tile = tl.sum(p, axis=0)  # [TILE_N]
-            imp_tile = tl.where(child_valid, imp_tile, NEG_INF)
-            imp_tile_2d = tl.reshape(imp_tile, [TILE_P, COMPRESSION_RATE])
+            attn_probs = tl.exp(scores - batch_m)
+            attn_probs = tl.where(child_valid[None, :] & g_valid[:, None], attn_probs, 0.0)
+            importance_tile = tl.sum(attn_probs, axis=0)  # [TILE_N]
+            importance_tile = tl.where(child_valid, importance_tile, NEG_INF)
+            importance_tile_2d = tl.reshape(importance_tile, [TILE_P, COMPRESSION_RATE])
 
-            # TODO Write tiled importance back to [PARENTS_PER_BATCH, CR]
-            for i_r in range(TILE_P):
+            # Write tiled importance back to [PARENTS_PER_BATCH, CR]
+            for i_r in tl.static_range(TILE_P):
                 row_off = (tile_base + i_r).to(tl.int32)
                 row_mask_in_tile = (tile_rows == i_r)[:, None]
-                row_vals = tl.sum(tl.where(row_mask_in_tile, imp_tile_2d, 0.0), axis=0)
+                row_vals = tl.sum(tl.where(row_mask_in_tile, importance_tile_2d, 0.0), axis=0)
                 row_vals = tl.where(row_off < PARENTS_PER_BATCH, row_vals, NEG_INF)
                 is_row = (batch_rows == row_off)[:, None]
-                imp_2d = tl.where(is_row, row_vals[None, :], imp_2d)
+                importance_matrix = tl.where(is_row, row_vals[None, :], importance_matrix)
 
         # ---- Phase 2: Top-K merge sort (unchanged) ----
-        imp_flat = tl.reshape(imp_2d, [BC])
+        importance_flat = tl.reshape(importance_matrix, [BC])
         buf_off = (i_batch * BC).to(tl.int32)
         pos = buf_off + tl.arange(0, BC).to(tl.int32)
-        valid_pos = pos < n_cand
-        imp_flat = tl.where(valid_pos, imp_flat, NEG_INF)
+        valid_pos = pos < num_candidates
+        importance_flat = tl.where(valid_pos, importance_flat, NEG_INF)
 
         # Rescale (running_topk, batch_importance) into a common max reference sel_m_new.
-        # - running_topk is already in the previous reference sel_m
+        # - running_topk is already in the previous reference topk_running_max
         # - current batch importance is in reference batch_m
-        sel_m_new = tl.maximum(sel_m, batch_m)
-        rescale_run = tl.exp(sel_m - sel_m_new)
+        sel_m_new = tl.maximum(topk_running_max, batch_m)
+        rescale_run = tl.exp(topk_running_max - sel_m_new)
         rescale_batch = tl.exp(batch_m - sel_m_new)
 
         run_int = running_topk_encoded.to(tl.int32, bitcast=True)
@@ -716,13 +741,13 @@ def htree_select_accumulate_gqa_kernel(
         run_rescaled_encoded = (run_rescaled_int & ~idx_mask) | run_raw_idx
         running_topk_encoded = run_rescaled_encoded.to(tl.float32, bitcast=True)
 
-        imp_flat = tl.where(imp_flat >= 0, imp_flat * rescale_batch, imp_flat)
-        imp_flat = tl.where(pos == rightmost_pos, 1e6, imp_flat)
-        sel_m = sel_m_new
+        importance_flat = tl.where(importance_flat >= 0, importance_flat * rescale_batch, importance_flat)
+        importance_flat = tl.where(pos == rightmost_pos, 1e6, importance_flat)
+        topk_running_max = sel_m_new
 
-        imp_int = imp_flat.to(tl.int32, bitcast=True)
-        encoded_idx = tl.where(imp_flat >= 0, ~pos, pos) & idx_mask
-        encoded_int = (imp_int & ~idx_mask) | encoded_idx
+        importance_int = importance_flat.to(tl.int32, bitcast=True)
+        encoded_idx = tl.where(importance_flat >= 0, ~pos, pos) & idx_mask
+        encoded_int = (importance_int & ~idx_mask) | encoded_idx
         batch_encoded = encoded_int.to(tl.float32, bitcast=True)
 
         running_b = tl.broadcast_to(running_topk_encoded[None, :], [2, TOP_K])
@@ -743,14 +768,14 @@ def htree_select_accumulate_gqa_kernel(
         clean_imp = clean_int.to(tl.float32, bitcast=True)
         drop_pos = tl.where(clean_imp >= 0, ~raw_idx, raw_idx)
         drop_pos = (drop_pos & idx_mask).to(tl.int32)
-        drop_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (drop_pos < n_cand)
+        drop_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (drop_pos < num_candidates)
 
         # ---- Phase 3: accumulate dropped via tl.dot ----
         drop_pos_2d = tl.reshape(drop_pos, [N_DROP_BLOCKS, DROP_BLOCK]).to(tl.int32)
         drop_valid_2d_i32 = tl.reshape(drop_valid.to(tl.int32), [N_DROP_BLOCKS, DROP_BLOCK])
 
-        for blk in range(N_DROP_BLOCKS):
-            row_mask = block_ids == blk
+        for drop_block_idx in range(N_DROP_BLOCKS):
+            row_mask = block_ids == drop_block_idx
             pos_blk = tl.sum(tl.where(row_mask, drop_pos_2d, 0), axis=0).to(tl.int32)
             valid_blk_i32 = tl.sum(tl.where(row_mask, drop_valid_2d_i32, 0), axis=0).to(tl.int32)
             valid_blk = valid_blk_i32 > 0
@@ -771,20 +796,20 @@ def htree_select_accumulate_gqa_kernel(
             safe_pos_d = tl.maximum(pos_blk, 0).to(tl.int64)
 
             k_row_d = k_base + safe_node[:, None] * (H_kv * K)
-            k1d = tl.load(k_row_d + o_k_half[None, :]).to(tl.float32)
-            k2d = tl.load(k_row_d + (K // 2) + o_k_half[None, :]).to(tl.float32)
+            k_lo_drop = tl.load(k_row_d + o_k_half[None, :]).to(tl.float32)
+            k_hi_drop = tl.load(k_row_d + (K // 2) + o_k_half[None, :]).to(tl.float32)
 
-            ckd = tl.load(cos_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
-            skd = tl.load(sin_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
-            kr1d = k1d * ckd - k2d * skd   # [DROP_BLOCK, K//2]
-            kr2d = k1d * skd + k2d * ckd   # [DROP_BLOCK, K//2]
+            cos_k_drop = tl.load(cos_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
+            sin_k_drop = tl.load(sin_cache + safe_pos_d[:, None] * (K // 2) + o_k_half[None, :])
+            k_rope_lo_drop = k_lo_drop * cos_k_drop - k_hi_drop * sin_k_drop   # [DROP_BLOCK, K//2]
+            k_rope_hi_drop = k_lo_drop * sin_k_drop + k_hi_drop * cos_k_drop   # [DROP_BLOCK, K//2]
 
             # Split tl.dot: [G_PAD, K//2] × [K//2, DROP_BLOCK] → [G_PAD, DROP_BLOCK]
-            scores_d = tl.dot(q_r1, tl.trans(kr1d)) + tl.dot(q_r2, tl.trans(kr2d))
+            scores_d = tl.dot(q_rope_lo, tl.trans(k_rope_lo_drop)) + tl.dot(q_rope_hi, tl.trans(k_rope_hi_drop))
             scores_d = tl.where(node_valid[None, :] & g_valid[:, None], scores_d, NEG_INF)
 
             v_row_d = v_base + safe_node[:, None] * (H_kv * V)
-            vt = tl.load(v_row_d + o_v[None, :]).to(tl.float32)  # [DROP_BLOCK, V]
+            v_tile = tl.load(v_row_d + o_v[None, :]).to(tl.float32)  # [DROP_BLOCK, V]
 
             tile_m = tl.max(scores_d, axis=1)  # [G_PAD]
             new_max = tl.maximum(cur_max, tile_m)
@@ -792,12 +817,12 @@ def htree_select_accumulate_gqa_kernel(
             cur_sum = cur_sum * alpha
             cur_output = cur_output * alpha[:, None]
 
-            p = tl.exp(scores_d - new_max[:, None])
-            p = tl.where(node_valid[None, :] & g_valid[:, None], p, 0.0)
-            cur_sum = cur_sum + tl.sum(p, axis=1)
+            attn_probs = tl.exp(scores_d - new_max[:, None])
+            attn_probs = tl.where(node_valid[None, :] & g_valid[:, None], attn_probs, 0.0)
+            cur_sum = cur_sum + tl.sum(attn_probs, axis=1)
 
             # PV via tl.dot: [G_PAD, DROP_BLOCK] × [DROP_BLOCK, V] → [G_PAD, V]
-            cur_output = cur_output + tl.dot(p.to(vt.dtype), vt)
+            cur_output = cur_output + tl.dot(attn_probs.to(v_tile.dtype), v_tile)
             cur_max = new_max
 
     # ---- Store layer states (first NUM_GROUPS heads only) ----
@@ -813,7 +838,7 @@ def htree_select_accumulate_gqa_kernel(
     clean_imp = clean_int.to(tl.float32, bitcast=True)
     topk_pos = tl.where(clean_imp >= 0, ~raw_idx, raw_idx)
     topk_pos = (topk_pos & idx_mask).to(tl.int32)
-    topk_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (topk_pos < n_cand)
+    topk_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (topk_pos < num_candidates)
     topk_pos = tl.where(topk_valid, topk_pos, -1).to(tl.int32)
 
     parent_off_f = tl.where(topk_pos >= 0, topk_pos // COMPRESSION_RATE, 0).to(tl.int32)
@@ -842,9 +867,9 @@ def htree_select_accumulate_gqa_kernel(
     tl.store(next_selected_parents + out_par_base + tl.arange(0, TOP_K), selected_sorted.to(tl.int32))
 
 
-# ==========================================
-# Main Forward Function
-# ==========================================
+# ========================================
+#  Main Forward Function
+# ========================================
 
 def htree_forward(
     q: torch.Tensor,
@@ -860,9 +885,9 @@ def htree_forward(
     htree Forward
     
     Args:
-        q: [B, T, H, K] - Query, H 个头
-        k: [B, T, H_kv, K] - Key, H_kv 个头 (H_kv <= H, H % H_kv == 0)
-        v: [B, T, H_kv, V] - Value, H_kv 个头
+        q: [B, T, H, K] - Query (H heads).
+        k: [B, T, H_kv, K] - Key (H_kv heads, H_kv <= H, H % H_kv == 0).
+        v: [B, T, H_kv, V] - Value (H_kv heads).
         compression_rate: 16
         max_top_nodes: 8192
         top_k_per_layer: 512
@@ -873,10 +898,10 @@ def htree_forward(
         output: [B, T, H, V]
     """
     B, T, H, K = q.shape
-    H_kv = k.shape[2]  # KV 头数量
+    H_kv = k.shape[2]  # number of KV heads
     V = v.shape[-1]
     
-    # 验证 GQA 配置
+    # Validate GQA configuration
     assert H % H_kv == 0, f"H ({H}) must be divisible by H_kv ({H_kv})"
     NUM_GROUPS = H // H_kv
     assert k.shape[2] == v.shape[2], f"K and V must have same number of heads"
@@ -907,9 +932,9 @@ def htree_forward(
     k = k.contiguous()
     v = v.contiguous()
     
-    # ========== Phase 1: Build Tree ==========
+    # --- Phase 1: Build Tree ---
     nvtx.range_push("Phase1_TreeBuilding")
-    print("Phase 1: Building tree structure...")
+    logger.info("Phase 1: Building tree structure...")
     
     num_layers = 1
     temp_len = T
@@ -917,7 +942,7 @@ def htree_forward(
         temp_len = (temp_len + compression_rate - 1) // compression_rate
         num_layers += 1
     
-    print(f"  Tree has {num_layers} layers (H={H}, H_kv={H_kv}, num_groups={NUM_GROUPS})")
+    logger.info(f"  Tree has {num_layers} layers (H={H}, H_kv={H_kv}, num_groups={NUM_GROUPS})")
     
     layers_k = [k]
     layers_v = [v]
@@ -933,35 +958,25 @@ def htree_forward(
         BLOCK_SIZE = 8
         grid = (triton.cdiv(next_len, BLOCK_SIZE), B * H_kv)
         
-        torch.cuda.synchronize()
-        start_build = torch.cuda.Event(enable_timing=True)
-        end_build = torch.cuda.Event(enable_timing=True)
-        start_build.record()
-
-        htree_build_kernel[grid](
-            current_k, current_v, next_k, next_v,
-            N_child=current_len,
-            N_parent=next_len,
-            B=B, H_kv=H_kv, K=K, V=V,
-            COMPRESSION_RATE=compression_rate,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-        end_build.record()
-        torch.cuda.synchronize()
-        time_build = start_build.elapsed_time(end_build)
+        with _cuda_timer(f"  Built layer {layer_idx}: {(current_len + compression_rate - 1) // compression_rate} nodes"):
+            htree_build_kernel[grid](
+                current_k, current_v, next_k, next_v,
+                N_child=current_len,
+                N_parent=next_len,
+                B=B, H_kv=H_kv, K=K, V=V,
+                COMPRESSION_RATE=compression_rate,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
         
         layers_k.append(next_k)
         layers_v.append(next_v)
         current_k, current_v = next_k, next_v
         current_len = next_len
-        
-        print(f"  Built layer {layer_idx}: {current_len} nodes, time: {time_build:.2f} ms")
     nvtx.range_pop()
 
-    # ========== Phase 1.5: Precompute RoPE cache ==========
+    # --- Phase 1.5: RoPE Cache ---
     nvtx.range_push("Phase1.5_RoPE_Cache")
-    print("Phase 1.5: Precomputing RoPE cache...")
+    logger.info("Phase 1.5: Precomputing RoPE cache...")
     
     cache_size = max_top_nodes + 1024
     inv_freq = 1.0 / (rope_base ** (torch.arange(0, K, 2, dtype=torch.float32, device=device) / K))
@@ -971,9 +986,9 @@ def htree_forward(
     sin_cache = freqs.sin()
     nvtx.range_pop()
 
-    # ========== Phase 2: Initialize Global State & Buffers ==========
+    # --- Phase 2: Init Global State ---
     nvtx.range_push("Phase2_Init_GlobalState_and_Buffers")
-    print("Phase 2: Initializing global states and buffers...")
+    logger.info("Phase 2: Initializing global states and buffers...")
     
     global_max = torch.full([B, T, H], -1e10, dtype=torch.float32, device=device)
     global_sum = torch.zeros([B, T, H], dtype=torch.float32, device=device)
@@ -981,9 +996,9 @@ def htree_forward(
     
     nvtx.range_pop()
 
-    # ========== Phase 3: Layer-by-layer Forward ==========
+    # --- Phase 3: Layer-by-layer Forward ---
     nvtx.range_push("Phase3_LayerByLayer_Forward")
-    print("Phase 3: Layer-by-layer forward pass...")
+    logger.info("Phase 3: Layer-by-layer forward pass...")
     
     layer_max = torch.empty([B, T, H], dtype=torch.float32, device=device)
     layer_sum = torch.empty([B, T, H], dtype=torch.float32, device=device)
@@ -1005,12 +1020,12 @@ def htree_forward(
     TILE_P = 4
     G_PAD = max(triton.next_power_of_2(NUM_GROUPS), 16)
     
-     # 为最顶层初始化 prev_selected_parents
+    # Initialize prev_selected_parents for the topmost layer
     top_layer_power = compression_rate ** (num_layers - 1)
     
     t_indices = torch.arange(T, dtype=torch.int32, device=device)  # [T]
-    rightmost_indices = t_indices // top_layer_power  # [T] 顶层最右侧节点索引
-    # 虚拟父节点数量: 每个虚拟父节点展开成16个顶层节点
+    rightmost_indices = t_indices // top_layer_power  # [T] rightmost node index at top layer
+    # Number of virtual parents (each expands to CR top-level nodes)
     num_virtual_parents = rightmost_indices // compression_rate + 1  # [T]
     
     # [T, TOP_K]
@@ -1029,118 +1044,91 @@ def htree_forward(
         is_bottom_layer = (layer_idx == 0)
         layer_power = compression_rate ** layer_idx
         
-        print(f"  -> Processing layer {layer_idx} (N={N_layer}, power={layer_power}, bottom={is_bottom_layer})...")
+        logger.info(f"  -> Processing layer {layer_idx} (N={N_layer}, power={layer_power}, bottom={is_bottom_layer})...")
         
         grid = (T, B * H)
 
         # Kernel 1: Select+Accumulate (dispatch bottom vs non-bottom)
         nvtx.range_push("K1_SelectAccumulate")
-        torch.cuda.synchronize()
-        start_k22 = torch.cuda.Event(enable_timing=True)
-        end_k22 = torch.cuda.Event(enable_timing=True)
-        start_k22.record()
-
         grid_kv = (T, B * H_kv)
-        if is_bottom_layer:
-            print("    Running bottom accumulate kernel (Kernel 1a)...")
-            htree_bottom_accumulate_gqa_kernel[grid_kv](
-                q, k_layer, v_layer,
-                prev_selected_parents,
-                cos_cache, sin_cache,
-                layer_max, layer_sum, layer_output,
-                layer_power=layer_power,
-                B=B, T=T, H=H, H_kv=H_kv,
-                NUM_GROUPS=NUM_GROUPS,
-                K=K, V=V, N_layer=N_layer,
-                COMPRESSION_RATE=compression_rate,
-                TOP_K=top_k_per_layer,
-                NEG_INF=HTREE_SCORE_NEG_INF,
-                G_PAD=G_PAD,
-                TILE_P=TILE_P,
-                scale=scale,
-            )
-        else:
-            print("    Running select+accumulate kernel (Kernel 1b)...")
-            htree_select_accumulate_gqa_kernel[grid_kv](
-                q, k_layer, v_layer,
-                prev_selected_parents,
-                cos_cache, sin_cache,
-                layer_max, layer_sum, layer_output,
-                next_selected_parents,
-                layer_power=layer_power,
-                B=B, T=T, H=H, H_kv=H_kv,
-                NUM_GROUPS=NUM_GROUPS,
-                K=K, V=V, N_layer=N_layer,
-                COMPRESSION_RATE=compression_rate,
-                TOP_K=top_k_per_layer,
-                LOG_N=LOG_N,
-                N_DIMS_TOPK=N_DIMS_TOPK,
-                SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
-                NEG_INF=HTREE_SCORE_NEG_INF,
-                DROP_BLOCK=DROP_BLOCK,
-                G_PAD=G_PAD,
-                TILE_P=TILE_P,
-                scale=scale,
-            )
-
-        end_k22.record()
-        torch.cuda.synchronize()
-        time_k22 = start_k22.elapsed_time(end_k22)
-        print(f"      Kernel 1 time: {time_k22:.2f} ms")
+        kernel_label = "Kernel 1a" if is_bottom_layer else "Kernel 1b"
+        with _cuda_timer(f"      {kernel_label}"):
+            if is_bottom_layer:
+                logger.info("    Running bottom accumulate kernel (Kernel 1a)...")
+                htree_bottom_accumulate_gqa_kernel[grid_kv](
+                    q, k_layer, v_layer,
+                    prev_selected_parents,
+                    cos_cache, sin_cache,
+                    layer_max, layer_sum, layer_output,
+                    layer_power=layer_power,
+                    B=B, T=T, H=H, H_kv=H_kv,
+                    NUM_GROUPS=NUM_GROUPS,
+                    K=K, V=V, N_layer=N_layer,
+                    COMPRESSION_RATE=compression_rate,
+                    TOP_K=top_k_per_layer,
+                    NEG_INF=HTREE_SCORE_NEG_INF,
+                    G_PAD=G_PAD,
+                    TILE_P=TILE_P,
+                    scale=scale,
+                )
+            else:
+                logger.info("    Running select+accumulate kernel (Kernel 1b)...")
+                htree_select_accumulate_gqa_kernel[grid_kv](
+                    q, k_layer, v_layer,
+                    prev_selected_parents,
+                    cos_cache, sin_cache,
+                    layer_max, layer_sum, layer_output,
+                    next_selected_parents,
+                    layer_power=layer_power,
+                    B=B, T=T, H=H, H_kv=H_kv,
+                    NUM_GROUPS=NUM_GROUPS,
+                    K=K, V=V, N_layer=N_layer,
+                    COMPRESSION_RATE=compression_rate,
+                    TOP_K=top_k_per_layer,
+                    LOG_N=LOG_N,
+                    N_DIMS_TOPK=N_DIMS_TOPK,
+                    SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
+                    NEG_INF=HTREE_SCORE_NEG_INF,
+                    DROP_BLOCK=DROP_BLOCK,
+                    G_PAD=G_PAD,
+                    TILE_P=TILE_P,
+                    scale=scale,
+                )
         nvtx.range_pop()
         
         # Kernel 2: Merge to Global State
         nvtx.range_push("K2_MergeToGlobal")
-        print("    Running merge to global kernel (Kernel 2)...")
-        
-        torch.cuda.synchronize()
-        start_k23 = torch.cuda.Event(enable_timing=True)
-        end_k23 = torch.cuda.Event(enable_timing=True)
-        start_k23.record()
-        
-        htree_merge_to_global_kernel[grid](
-            layer_max, layer_sum, layer_output,
-            global_max, global_sum, global_output,
-            B=B, T=T, H=H, V=V,
-        )
-        end_k23.record()
-        torch.cuda.synchronize()
-        time_k23 = start_k23.elapsed_time(end_k23)
-        print(f"      Kernel 2 time: {time_k23:.2f} ms")
-        
+        logger.info("    Running merge to global kernel (Kernel 2)...")
+        with _cuda_timer("      Kernel 2"):
+            htree_merge_to_global_kernel[grid](
+                layer_max, layer_sum, layer_output,
+                global_max, global_sum, global_output,
+                B=B, T=T, H=H, V=V,
+            )
         nvtx.range_pop()
 
-        # 更新 parent indices: fused kernel already produced next_selected_parents (sorted asc).
+        # Swap parent indices: next becomes prev for the layer below.
         if not is_bottom_layer:
             prev_selected_parents, next_selected_parents = next_selected_parents, prev_selected_parents
         
         nvtx.range_pop()
     nvtx.range_pop()
 
-    # ========== Phase 4: Final Normalization ==========
+    # --- Phase 4: Final Normalize ---
     nvtx.range_push("Phase4_Final_Normalize")
-    print("Phase 4: Final normalization...")
+    logger.info("Phase 4: Final normalization...")
     
     output = torch.empty(B, T, H, V, dtype=dtype, device=device)
     grid = (T, B * H)
     
-    torch.cuda.synchronize()
-    start_k4 = torch.cuda.Event(enable_timing=True)
-    end_k4 = torch.cuda.Event(enable_timing=True)
-    start_k4.record()
-    
-    htree_final_normalize_kernel[grid](
-        global_output, global_sum, output,
-        B=B, T=T, H=H, V=V,
-    )
-    end_k4.record()
-    torch.cuda.synchronize()
-    time_k4 = start_k4.elapsed_time(end_k4)
-    print(f"  Kernel 3 time (final normalize): {time_k4:.2f} ms")
-    
+    with _cuda_timer("  Kernel 3 (final normalize)"):
+        htree_final_normalize_kernel[grid](
+            global_output, global_sum, output,
+            B=B, T=T, H=H, V=V,
+        )
     nvtx.range_pop()
 
-    print("htree forward pass completed!")
+    logger.info("htree forward pass completed!")
     
     return output
 
