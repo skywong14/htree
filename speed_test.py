@@ -323,8 +323,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--htree-top-k", type=int, default=512)
     parser.add_argument("--htree-compression-rate", type=int, default=16)
     parser.add_argument("--htree-max-top-nodes", type=int, default=8192)
-    parser.add_argument("--warmup", type=int, default=3)
-    parser.add_argument("--iters", type=int, default=3)
+    parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--iters", type=int, default=2)
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="float32")
     parser.add_argument("--only", choices=["all", "htree", "nsa"], default="all",
                         help="Run only a subset of benchmarks (default: all)")
