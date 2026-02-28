@@ -880,6 +880,7 @@ def htree_forward(
     top_k_per_layer: int = 512,
     scale: Optional[float] = None,
     rope_base: float = 10000.0,
+    _save_for_backward: bool = False,
 ) -> torch.Tensor:
     """
     htree Forward
@@ -1034,8 +1035,11 @@ def htree_forward(
     prev_selected_parents = torch.where(valid_mask, parent_candidates, torch.tensor(-1, dtype=torch.int32, device=device))
     prev_selected_parents = prev_selected_parents.unsqueeze(0).unsqueeze(2).expand(B, T, H_kv, top_k_per_layer).contiguous()
     next_selected_parents = torch.empty_like(prev_selected_parents)
+    per_layer_parents = {} if _save_for_backward else None
     
     for layer_idx in range(num_layers - 1, -1, -1):
+        if _save_for_backward:
+            per_layer_parents[layer_idx] = prev_selected_parents.clone()
         nvtx.range_push(f"Forward_Layer_{layer_idx}")
         k_layer = layers_k[layer_idx]
         v_layer = layers_v[layer_idx]
@@ -1130,6 +1134,26 @@ def htree_forward(
 
     logger.info("htree forward pass completed!")
     
+    if _save_for_backward:
+        bwd_ctx = dict(
+            global_max=global_max,
+            global_sum=global_sum,
+            per_layer_parents=per_layer_parents,
+            layers_k=layers_k,
+            layers_v=layers_v,
+            cos_cache=cos_cache,
+            sin_cache=sin_cache,
+            num_layers=num_layers,
+            compression_rate=compression_rate,
+            top_k_per_layer=top_k_per_layer,
+            max_top_nodes=max_top_nodes,
+            scale=scale,
+            NUM_GROUPS=NUM_GROUPS,
+            G_PAD=G_PAD,
+            TILE_P=TILE_P,
+            DROP_BLOCK=DROP_BLOCK,
+        )
+        return output, bwd_ctx
     return output
 
 
