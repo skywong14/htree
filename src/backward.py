@@ -4,12 +4,13 @@ HTree Backward Triton Kernels
 
 Kernel architecture (FlashAttention-2 style split dQ / dKV):
 
-  K0: htree_bwd_preprocess_delta      – D = rowsum(dO * O)
-  K1: htree_bwd_dq_bottom             – Q-stationary dQ for bottom layer
-      htree_bwd_dq_upper_dkv          – Q-stationary dQ + atomic dKV for upper layers
-  K2: htree_bwd_build_parent_mask     – dense reverse index for K3
-  K3: htree_bwd_dkv_bottom            – K-stationary dKV for bottom layer (no atomics)
-  K4: htree_bwd_tree_backward         – mean-pool gradient propagation
+  K0:  htree_bwd_preprocess_delta       D = rowsum(dO * O)
+  K1a: htree_bwd_dq_bottom              Q-stationary dQ for bottom layer
+  K1b: htree_bwd_dq_upper               Q-stationary dQ for upper layers (dropped only)
+  K2:  htree_bwd_build_parent_mask      dense reverse index (reused for bottom & upper)
+  K3:  htree_bwd_dkv_bottom             K-stationary dKV for bottom layer (no atomics)
+  K3u: htree_bwd_dkv_upper              K-stationary dKV for upper layers (no atomics)
+  K4:  htree_bwd_tree_backward          mean-pool gradient propagation
 """
 
 import logging
@@ -89,7 +90,7 @@ def htree_bwd_build_parent_mask_kernel(
         + i_h_kv.to(tl.int64) * TOP_K
     )
 
-    for tk_off in tl.static_range(0, TOP_K, BLOCK_TK):
+    for tk_off in range(0, TOP_K, BLOCK_TK):
         offs = tl.arange(0, BLOCK_TK)
         parents = tl.load(selected_parents + sel_base + tk_off + offs, mask=(tk_off + offs) < TOP_K, other=-1)
         valid = parents >= 0
@@ -267,11 +268,11 @@ def htree_bwd_dq_bottom_kernel(
 
 
 # ============================================================
-#  K1-upper: dQ + atomic dKV for non-bottom layers
+#  K1b-dQ: dQ for upper (non-bottom) layers  (Q-stationary)
 # ============================================================
 
 @triton.jit
-def htree_bwd_dq_upper_dkv_kernel(
+def htree_bwd_dq_upper_kernel(
     q,                        # [B, T, H, K]
     layer_k, layer_v,         # [B, N_layer, H_kv, K/V]
     prev_selected_parents,    # [B, T, H_kv, TOP_K]  (this layer's parents)
@@ -281,7 +282,6 @@ def htree_bwd_dq_upper_dkv_kernel(
     delta,                    # [B, T, H]
     global_max, global_sum,   # [B, T, H]
     dq,                       # [B, T, H, K]     (accumulated)
-    dk_layer, dv_layer,       # [B, N_layer, H_kv, K/V]  (atomic target)
     layer_power: tl.constexpr,
     B: tl.constexpr,
     T,
@@ -295,15 +295,13 @@ def htree_bwd_dq_upper_dkv_kernel(
     TOP_K: tl.constexpr,
     DROP_BLOCK: tl.constexpr,
     G_PAD: tl.constexpr,
-    TILE_P: tl.constexpr,
     scale,
     SEL_CHUNK: tl.constexpr,
 ):
-    """Grid: (T, B * H_kv). Mirrors forward K1b but computes gradients.
+    """Grid: (T, B * H_kv). Q-stationary dQ for upper (non-bottom) layers.
 
-    For non-bottom layers, only *dropped* candidates contribute gradients
-    (selected ones are passed to the child layer and handled there).
-    dK/dV are scattered via tl.atomic_add.
+    Only *dropped* candidates (not selected by child layer) contribute dQ.
+    dKV is handled separately by the K-stationary htree_bwd_dkv_upper_kernel.
     """
     i_t = tl.program_id(0)
     pid = tl.program_id(1)
@@ -329,14 +327,12 @@ def htree_bwd_dq_upper_dkv_kernel(
     num_candidates = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
     rope_pos_q = num_candidates - 1
 
-    # Load next-layer selected parents for merge-mask computation
     next_sel_base = (
         i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
         + i_t.to(tl.int64) * H_kv * TOP_K
         + i_h_kv.to(tl.int64) * TOP_K
     )
 
-    # Load Q
     g_ids = tl.arange(0, G_PAD).to(tl.int64)
     g_valid = g_ids < NUM_GROUPS
     head_ids = (i_h_kv.to(tl.int64) * NUM_GROUPS + g_ids) * g_valid.to(tl.int64)
@@ -352,7 +348,6 @@ def htree_bwd_dq_upper_dkv_kernel(
     q_rope_lo = (q_lo * cos_q[None, :] - q_hi * sin_q[None, :]) * scale
     q_rope_hi = (q_lo * sin_q[None, :] + q_hi * cos_q[None, :]) * scale
 
-    # Load dO, D, global_max, global_sum
     do_base = i_b.to(tl.int64) * T_i64 * H * V + i_t.to(tl.int64) * H * V
     o_v = tl.arange(0, V).to(tl.int64)
     do_block = tl.load(do + do_base + head_ids[:, None] * V + o_v[None, :],
@@ -366,21 +361,14 @@ def htree_bwd_dq_upper_dkv_kernel(
     dq_tilde_lo = tl.zeros([G_PAD, K // 2], dtype=tl.float32)
     dq_tilde_hi = tl.zeros([G_PAD, K // 2], dtype=tl.float32)
 
-    TILE_N: tl.constexpr = TILE_P * COMPRESSION_RATE
     k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
     v_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
-    dk_base = dk_layer + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
-    dv_base = dv_layer + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
 
     o_n = tl.arange(0, DROP_BLOCK).to(tl.int32)
 
-    # Iterate over all candidates and process only the DROPPED ones.
-    # Expand candidates the same way the forward K1b does, but use flat iteration
-    # with DROP_BLOCK-sized tiles over ALL candidates. For each candidate, check
-    # if its node_index is NOT in next_layer_parents (meaning it was dropped).
     num_drop_tiles = (num_candidates + DROP_BLOCK - 1) // DROP_BLOCK
     for d_tile in range(num_drop_tiles):
-        flat_pos = (d_tile * DROP_BLOCK).to(tl.int32) + o_n  # [DROP_BLOCK]
+        flat_pos = (d_tile * DROP_BLOCK).to(tl.int32) + o_n
         pos_valid = flat_pos < num_candidates
 
         parent_off = (flat_pos // COMPRESSION_RATE).to(tl.int32)
@@ -394,9 +382,8 @@ def htree_bwd_dq_upper_dkv_kernel(
         node_idx = tl.maximum(parent_idx, 0) * COMPRESSION_RATE + child_slot
         cand_valid = pos_valid & (parent_off < num_valid_parents) & (parent_idx >= 0) & ch_ok & (node_idx >= 0) & (node_idx < N_layer)
 
-        # Determine merge mask: check if node_idx is in next_layer_parents (selected → NOT dropped)
         is_selected = tl.zeros([DROP_BLOCK], dtype=tl.int32)
-        for chunk_start in tl.static_range(0, TOP_K, SEL_CHUNK):
+        for chunk_start in range(0, TOP_K, SEL_CHUNK):
             sel_chunk = tl.load(
                 next_layer_parents + next_sel_base + chunk_start + tl.arange(0, SEL_CHUNK)
             ).to(tl.int32)
@@ -431,27 +418,6 @@ def htree_bwd_dq_upper_dkv_kernel(
             dq_tilde_lo += tl.dot(dS.to(k_rope_lo.dtype), k_rope_lo)
             dq_tilde_hi += tl.dot(dS.to(k_rope_hi.dtype), k_rope_hi)
 
-            dk_tilde_lo = tl.dot(tl.trans(dS).to(q_rope_lo.dtype), q_rope_lo)
-            dk_tilde_hi = tl.dot(tl.trans(dS).to(q_rope_hi.dtype), q_rope_hi)
-            dk_pre_lo = dk_tilde_lo * cos_k + dk_tilde_hi * sin_k
-            dk_pre_hi = -dk_tilde_lo * sin_k + dk_tilde_hi * cos_k
-
-            dv_contrib = tl.dot(tl.trans(P).to(do_block.dtype), do_block)
-
-            for c_idx in tl.static_range(DROP_BLOCK):
-                c_dropped = tl.sum(tl.where(o_n == c_idx, is_dropped.to(tl.int32), 0))
-                if c_dropped > 0:
-                    ni = tl.sum(tl.where(o_n == c_idx, safe_node, 0)).to(tl.int64)
-                    dk_ptr = dk_base + ni * (H_kv * K)
-                    dv_ptr = dv_base + ni * (H_kv * V)
-                    dk_lo_c = tl.sum(tl.where((o_n == c_idx)[:, None], dk_pre_lo, 0.0), axis=0)
-                    dk_hi_c = tl.sum(tl.where((o_n == c_idx)[:, None], dk_pre_hi, 0.0), axis=0)
-                    dv_c = tl.sum(tl.where((o_n == c_idx)[:, None], dv_contrib, 0.0), axis=0)
-                    tl.atomic_add(dk_ptr + o_k_half, dk_lo_c)
-                    tl.atomic_add(dk_ptr + K // 2 + o_k_half, dk_hi_c)
-                    tl.atomic_add(dv_ptr + o_v, dv_c)
-
-    # Inverse RoPE on dQ and store
     dq_lo_result = scale * (dq_tilde_lo * cos_q[None, :] + dq_tilde_hi * sin_q[None, :])
     dq_hi_result = scale * (-dq_tilde_lo * sin_q[None, :] + dq_tilde_hi * cos_q[None, :])
 
@@ -461,6 +427,187 @@ def htree_bwd_dq_upper_dkv_kernel(
     old_dq_hi = tl.load(dq_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
     tl.store(dq_ptrs + o_k_half[None, :], old_dq_lo + dq_lo_result, mask=g_valid[:, None])
     tl.store(dq_ptrs + (K // 2) + o_k_half[None, :], old_dq_hi + dq_hi_result, mask=g_valid[:, None])
+
+
+# ============================================================
+#  K1b-dKV: dKV for upper (non-bottom) layers  (K-stationary)
+# ============================================================
+
+@triton.jit
+def htree_bwd_dkv_upper_kernel(
+    q,                        # [B, T, H, K]
+    layer_k, layer_v,         # [B, N_layer, H_kv, K/V]
+    prev_selected_parents,    # [B, T, H_kv, TOP_K] (this layer's parents – group indices)
+    next_layer_parents,       # [B, T, H_kv, TOP_K] (child layer selected_parents – node indices)
+    cos_cache, sin_cache,
+    do,                       # [B, T, H, V]
+    delta,                    # [B, T, H]
+    global_max, global_sum,   # [B, T, H]
+    parent_mask,              # [B, H_kv, num_parent_groups, T] uint8
+    dk, dv,                   # [B, N_layer, H_kv, K/V] (output)
+    layer_power: tl.constexpr,
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    H_kv: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    N_layer: tl.constexpr,
+    COMPRESSION_RATE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    num_parent_groups: tl.constexpr,
+    G_PAD: tl.constexpr,
+    SEL_CHUNK: tl.constexpr,
+    scale,
+):
+    """K-stationary dKV for upper (non-bottom) layers.
+    Grid: (num_parent_groups, B * H_kv).
+
+    Each program handles one parent group g (CR nodes), iterating over all
+    queries that attend to it (using parent_mask).  For each query, only
+    DROPPED children (not in next_layer_parents) contribute dKV.
+    """
+    i_g = tl.program_id(0)
+    pid = tl.program_id(1)
+    i_b = pid // H_kv
+    i_h_kv = pid % H_kv
+
+    T_i64 = T.to(tl.int64)
+
+    o_cr = tl.arange(0, COMPRESSION_RATE).to(tl.int64)
+    node_start = i_g.to(tl.int64) * COMPRESSION_RATE
+    node_ids = node_start + o_cr
+    node_valid = node_ids < N_layer
+    node_ids_i32 = node_ids.to(tl.int32)
+
+    o_k_half = tl.arange(0, K // 2).to(tl.int64)
+    o_v_dim = tl.arange(0, V).to(tl.int64)
+
+    k_group_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
+    v_group_base = layer_v + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
+
+    k_lo = tl.load(k_group_base + node_ids[:, None] * (H_kv * K) + o_k_half[None, :],
+                   mask=node_valid[:, None], other=0.0).to(tl.float32)
+    k_hi = tl.load(k_group_base + node_ids[:, None] * (H_kv * K) + (K // 2) + o_k_half[None, :],
+                   mask=node_valid[:, None], other=0.0).to(tl.float32)
+    v_block = tl.load(v_group_base + node_ids[:, None] * (H_kv * V) + o_v_dim[None, :],
+                      mask=node_valid[:, None], other=0.0).to(tl.float32)
+
+    dk_lo_acc = tl.zeros([COMPRESSION_RATE, K // 2], dtype=tl.float32)
+    dk_hi_acc = tl.zeros([COMPRESSION_RATE, K // 2], dtype=tl.float32)
+    dv_acc = tl.zeros([COMPRESSION_RATE, V], dtype=tl.float32)
+
+    g_ids = tl.arange(0, G_PAD).to(tl.int64)
+    g_valid = g_ids < NUM_GROUPS
+    head_ids = (i_h_kv.to(tl.int64) * NUM_GROUPS + g_ids) * g_valid.to(tl.int64)
+
+    mask_base = (
+        i_b.to(tl.int64) * H_kv * num_parent_groups * T_i64
+        + i_h_kv.to(tl.int64) * num_parent_groups * T_i64
+        + i_g.to(tl.int64) * T_i64
+    )
+
+    for i_t in range(T):
+        m_val = tl.load(parent_mask + mask_base + i_t.to(tl.int64))
+        if m_val != 0:
+            rightmost_idx_t = i_t // layer_power
+            rightmost_child_idx_t = rightmost_idx_t % COMPRESSION_RATE
+
+            sel_base_t = (
+                i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
+                + i_t.to(tl.int64) * H_kv * TOP_K
+                + i_h_kv.to(tl.int64) * TOP_K
+            )
+            parent_list_t = tl.load(prev_selected_parents + sel_base_t + tl.arange(0, TOP_K))
+            num_valid_t = tl.sum((parent_list_t >= 0).to(tl.int32))
+
+            match_mask = (parent_list_t == i_g.to(tl.int32)) & (parent_list_t >= 0)
+            match_pos = tl.arange(0, TOP_K).to(tl.int32)
+            pos_in_list = tl.min(tl.where(match_mask, match_pos, TOP_K))
+
+            if pos_in_list < TOP_K:
+                num_candidates_t = ((num_valid_t - 1) * COMPRESSION_RATE + rightmost_child_idx_t + 1).to(tl.int32)
+                rope_pos_q_t = num_candidates_t - 1
+
+                k_flat_base = pos_in_list.to(tl.int64) * COMPRESSION_RATE
+                k_flat_pos = k_flat_base + o_cr
+
+                is_rightmost_group = (i_g == (rightmost_idx_t // COMPRESSION_RATE))
+                k_valid = node_valid & tl.where(
+                    is_rightmost_group,
+                    o_cr.to(tl.int32) <= rightmost_child_idx_t,
+                    True
+                )
+
+                # Dropped check: children NOT in next_layer_parents
+                next_sel_base_t = (
+                    i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
+                    + i_t.to(tl.int64) * H_kv * TOP_K
+                    + i_h_kv.to(tl.int64) * TOP_K
+                )
+                is_selected = tl.zeros([COMPRESSION_RATE], dtype=tl.int32)
+                for chunk_start in range(0, TOP_K, SEL_CHUNK):
+                    sel_chunk = tl.load(
+                        next_layer_parents + next_sel_base_t + chunk_start + tl.arange(0, SEL_CHUNK)
+                    ).to(tl.int32)
+                    matches = (node_ids_i32[:, None] == sel_chunk[None, :]).to(tl.int32)
+                    is_selected += tl.sum(matches, axis=1)
+
+                is_dropped = (is_selected == 0) & k_valid
+                num_dropped = tl.sum(is_dropped.to(tl.int32))
+
+                if num_dropped > 0:
+                    cos_k_t = tl.load(cos_cache + k_flat_pos[:, None] * (K // 2) + o_k_half[None, :],
+                                      mask=k_valid[:, None], other=0.0)
+                    sin_k_t = tl.load(sin_cache + k_flat_pos[:, None] * (K // 2) + o_k_half[None, :],
+                                      mask=k_valid[:, None], other=0.0)
+                    k_rope_lo = k_lo * cos_k_t - k_hi * sin_k_t
+                    k_rope_hi = k_lo * sin_k_t + k_hi * cos_k_t
+
+                    q_bt_base_t = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
+                    q_ptrs_t = q + q_bt_base_t + head_ids[:, None] * K
+                    q_lo_t = tl.load(q_ptrs_t + o_k_half[None, :], mask=g_valid[:, None], other=0.0).to(tl.float32)
+                    q_hi_t = tl.load(q_ptrs_t + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0).to(tl.float32)
+
+                    cos_q_t = tl.load(cos_cache + rope_pos_q_t.to(tl.int64) * (K // 2) + o_k_half)
+                    sin_q_t = tl.load(sin_cache + rope_pos_q_t.to(tl.int64) * (K // 2) + o_k_half)
+                    q_rope_lo_t = (q_lo_t * cos_q_t[None, :] - q_hi_t * sin_q_t[None, :]) * scale
+                    q_rope_hi_t = (q_lo_t * sin_q_t[None, :] + q_hi_t * cos_q_t[None, :]) * scale
+
+                    S = tl.dot(q_rope_lo_t, tl.trans(k_rope_lo)) + tl.dot(q_rope_hi_t, tl.trans(k_rope_hi))
+                    S = tl.where(is_dropped[None, :] & g_valid[:, None], S, 0.0)
+
+                    state_base_t = i_b.to(tl.int64) * T_i64 * H + i_t.to(tl.int64) * H
+                    gm_t = tl.load(global_max + state_base_t + head_ids, mask=g_valid, other=0.0)
+                    gs_t = tl.load(global_sum + state_base_t + head_ids, mask=g_valid, other=1.0)
+                    P = tl.exp(S - gm_t[:, None]) / gs_t[:, None]
+                    P = tl.where(is_dropped[None, :] & g_valid[:, None], P, 0.0)
+
+                    do_base_t = i_b.to(tl.int64) * T_i64 * H * V + i_t.to(tl.int64) * H * V
+                    do_t = tl.load(do + do_base_t + head_ids[:, None] * V + o_v_dim[None, :],
+                                   mask=g_valid[:, None], other=0.0).to(tl.float32)
+                    D_t = tl.load(delta + state_base_t + head_ids, mask=g_valid, other=0.0)
+
+                    dP = tl.dot(do_t, tl.trans(v_block))
+                    dS = P * (dP - D_t[:, None])
+
+                    dk_tilde_lo = tl.dot(tl.trans(dS).to(q_rope_lo_t.dtype), q_rope_lo_t)
+                    dk_tilde_hi = tl.dot(tl.trans(dS).to(q_rope_hi_t.dtype), q_rope_hi_t)
+                    dk_lo_acc += dk_tilde_lo * cos_k_t + dk_tilde_hi * sin_k_t
+                    dk_hi_acc += -dk_tilde_lo * sin_k_t + dk_tilde_hi * cos_k_t
+
+                    dv_acc += tl.dot(tl.trans(P).to(do_t.dtype), do_t)
+
+    dk_out_base = dk + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
+    dv_out_base = dv + i_b.to(tl.int64) * N_layer * H_kv * V + i_h_kv.to(tl.int64) * V
+
+    tl.store(dk_out_base + node_ids[:, None] * (H_kv * K) + o_k_half[None, :],
+             dk_lo_acc, mask=node_valid[:, None])
+    tl.store(dk_out_base + node_ids[:, None] * (H_kv * K) + (K // 2) + o_k_half[None, :],
+             dk_hi_acc, mask=node_valid[:, None])
+    tl.store(dv_out_base + node_ids[:, None] * (H_kv * V) + o_v_dim[None, :],
+             dv_acc, mask=node_valid[:, None])
 
 
 # ============================================================
@@ -658,7 +805,7 @@ def htree_bwd_tree_backward_kernel(
     o_k = tl.arange(0, K).to(tl.int64)
     o_v_dim = tl.arange(0, V).to(tl.int64)
 
-    for p_local in tl.static_range(BLOCK_P):
+    for p_local in range(BLOCK_P):
         p_idx = p_start + p_local
         if p_idx < N_parent:
             child_start = p_idx * COMPRESSION_RATE
@@ -673,7 +820,7 @@ def htree_bwd_tree_backward_kernel(
                 dk_p = tl.load(pk_base + o_k).to(tl.float32) / count.to(tl.float32)
                 dv_p = tl.load(pv_base + o_v_dim).to(tl.float32) / count.to(tl.float32)
 
-                for c_off in tl.static_range(COMPRESSION_RATE):
+                for c_off in range(COMPRESSION_RATE):
                     c_idx = child_start + c_off
                     if c_idx < N_child:
                         ck_base = dk_child + (i_b.to(tl.int64) * N_child * H_kv * K
@@ -794,16 +941,17 @@ def htree_backward(dO, q, output, bwd_ctx):
                     G_PAD=G_PAD, scale=scale,
                 )
         else:
-            # K1-upper: dQ + atomic dKV
             next_layer_parents = per_layer_parents[layer_idx - 1]
             SEL_CHUNK = min(top_k_per_layer, 64)
-            with _cuda_timer("    Kernel K1b (dQ+dKV upper)"):
-                htree_bwd_dq_upper_dkv_kernel[grid_kv](
+
+            # K1b-dQ: Q-stationary dQ for upper layer
+            with _cuda_timer("    Kernel K1b-dQ (dQ upper)"):
+                htree_bwd_dq_upper_kernel[grid_kv](
                     q, k_layer, v_layer,
                     psp, next_layer_parents,
                     cos_cache, sin_cache,
                     dO, delta, global_max, global_sum,
-                    dq, dk_layers[layer_idx], dv_layers[layer_idx],
+                    dq,
                     layer_power=layer_power,
                     B=B, T=T, H=H, H_kv=H_kv,
                     NUM_GROUPS=NUM_GROUPS,
@@ -811,9 +959,43 @@ def htree_backward(dO, q, output, bwd_ctx):
                     COMPRESSION_RATE=compression_rate,
                     TOP_K=top_k_per_layer,
                     DROP_BLOCK=DROP_BLOCK,
-                    G_PAD=G_PAD, TILE_P=TILE_P,
+                    G_PAD=G_PAD,
                     scale=scale,
                     SEL_CHUNK=SEL_CHUNK,
+                )
+
+            # K2-upper: build parent mask (reuse bottom-layer K2 kernel)
+            num_upper_parent_groups = (N_layer + compression_rate - 1) // compression_rate
+            upper_parent_mask = torch.zeros(B, H_kv, num_upper_parent_groups, T,
+                                            dtype=torch.uint8, device=device)
+            BLOCK_TK = min(top_k_per_layer, 64)
+            with _cuda_timer("    Kernel K2u (build upper parent mask)"):
+                htree_bwd_build_parent_mask_kernel[grid_kv](
+                    psp, upper_parent_mask,
+                    T=T, H_kv=H_kv, TOP_K=top_k_per_layer,
+                    num_groups=num_upper_parent_groups, BLOCK_TK=BLOCK_TK,
+                )
+
+            # K3-upper: K-stationary dKV for upper layer (no atomics)
+            grid_upper_kv = (num_upper_parent_groups, B * H_kv)
+            with _cuda_timer("    Kernel K3u (dKV upper)"):
+                htree_bwd_dkv_upper_kernel[grid_upper_kv](
+                    q, k_layer, v_layer,
+                    psp, next_layer_parents,
+                    cos_cache, sin_cache,
+                    dO, delta, global_max, global_sum,
+                    upper_parent_mask,
+                    dk_layers[layer_idx], dv_layers[layer_idx],
+                    layer_power=layer_power,
+                    B=B, T=T, H=H, H_kv=H_kv,
+                    NUM_GROUPS=NUM_GROUPS,
+                    K=K, V=V, N_layer=N_layer,
+                    COMPRESSION_RATE=compression_rate,
+                    TOP_K=top_k_per_layer,
+                    num_parent_groups=num_upper_parent_groups,
+                    G_PAD=G_PAD,
+                    SEL_CHUNK=SEL_CHUNK,
+                    scale=scale,
                 )
 
     # K4: tree backward – propagate gradients down through mean-pooling
