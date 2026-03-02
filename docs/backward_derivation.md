@@ -358,7 +358,7 @@ In the forward, the non-bottom kernel selects top-K and immediately accumulates 
 - **(A) Re-run the importance + top-K logic** in the backward kernel (recompute scores, compute importance, select top-K, then the complement is dropped). This avoids extra storage but adds compute.
 - **(B) Save an explicit dropped mask** from forward. Extra storage but simpler backward logic.
 
-**Recommendation**: Option (A) is preferred — it's consistent with the FlashAttention philosophy of recomputation over storage, and the top-K computation is relatively cheap compared to the attention backward.
+**Recommendation**: Option (A) is preferred — it's consistent with the FlashAttention philosophy of recomputation over storage, and the top-K computation is relatively cheap compared to the attention backward. *Note: The current code (parallel.py / backward.py) uses Option (B) — saves per_layer_parents from forward and reuses them in backward, without recomputing Top-K.*
 
 ### 6.4 Memory Budget for Saved States
 
