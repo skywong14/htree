@@ -21,7 +21,14 @@ import torch
 import triton
 import triton.language as tl
 
-from src.parallel import _cuda_timer, htree_forward
+from src.parallel import (
+    _cuda_timer,
+    htree_forward,
+    htree_build_kernel,
+    htree_recompute_selection_kernel,
+    HTREE_SCORE_NEG_INF,
+    HTREE_SCORE_VALID_THRESHOLD,
+)
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -835,6 +842,106 @@ def htree_bwd_tree_backward_kernel(
 
 
 # ============================================================
+#  Recompute helpers (gradient checkpointing for parents)
+# ============================================================
+
+def _recompute_tree_build(k, v, num_layers, compression_rate):
+    """Rebuild upper-layer tree K/V from bottom-layer K/V via mean-pooling."""
+    B = k.shape[0]
+    T = k.shape[1]
+    H_kv = k.shape[2]
+    K = k.shape[3]
+    V = v.shape[3]
+    device, dtype = k.device, k.dtype
+
+    layers_k, layers_v = [k], [v]
+    current_k, current_v, current_len = k, v, T
+
+    for layer_idx in range(1, num_layers):
+        next_len = (current_len + compression_rate - 1) // compression_rate
+        next_k = torch.empty(B, next_len, H_kv, K, dtype=dtype, device=device)
+        next_v = torch.empty(B, next_len, H_kv, V, dtype=dtype, device=device)
+
+        BLOCK_SIZE = 8
+        grid = (triton.cdiv(next_len, BLOCK_SIZE), B * H_kv)
+        htree_build_kernel[grid](
+            current_k, current_v, next_k, next_v,
+            N_child=current_len, N_parent=next_len,
+            B=B, H_kv=H_kv, K=K, V=V,
+            COMPRESSION_RATE=compression_rate, BLOCK_SIZE=BLOCK_SIZE,
+        )
+        layers_k.append(next_k)
+        layers_v.append(next_v)
+        current_k, current_v = next_k, next_v
+        current_len = next_len
+
+    return layers_k, layers_v
+
+
+def _recompute_parents(q, layers_k, cos_cache, sin_cache,
+                       num_layers, compression_rate, top_k_per_layer,
+                       max_top_nodes, scale, NUM_GROUPS, G_PAD, TILE_P):
+    """Replay forward selection loop to reconstruct per_layer_parents."""
+    B, T, H, K = q.shape
+    H_kv = layers_k[0].shape[2]
+    device = q.device
+
+    MAX_CANDIDATES = max_top_nodes
+    LOG_N = int(math.log2(MAX_CANDIDATES))
+    N_DIMS_TOPK = int(math.log2(top_k_per_layer))
+
+    top_layer_power = compression_rate ** (num_layers - 1)
+    t_indices = torch.arange(T, dtype=torch.int32, device=device)
+    rightmost_indices = t_indices // top_layer_power
+    num_virtual_parents = rightmost_indices // compression_rate + 1
+    parent_cands = torch.arange(top_k_per_layer, dtype=torch.int32, device=device)
+    parent_cands = parent_cands.unsqueeze(0).expand(T, -1)
+    valid_mask = parent_cands < num_virtual_parents.unsqueeze(1)
+    prev_sp = torch.where(valid_mask, parent_cands,
+                          torch.tensor(-1, dtype=torch.int32, device=device))
+    prev_sp = prev_sp.unsqueeze(0).unsqueeze(2).expand(
+        B, T, H_kv, top_k_per_layer).contiguous()
+    next_sp = torch.empty_like(prev_sp)
+
+    per_layer_parents = {}
+    for layer_idx in range(num_layers - 1, -1, -1):
+        per_layer_parents[layer_idx] = prev_sp
+
+        if layer_idx > 0:
+            k_layer = layers_k[layer_idx]
+            N_layer = k_layer.shape[1]
+            layer_power = compression_rate ** layer_idx
+            grid_kv = (T, B * H_kv)
+
+            # Allocate a fresh output buffer each iteration so that the tensor
+            # already stored in per_layer_parents[layer_idx] (= current prev_sp)
+            # is never overwritten by a later selection kernel.  Reusing next_sp
+            # via a swap would alias per_layer_parents[num_layers-1] with the
+            # buffer written in the next pass, corrupting the stored parents when
+            # num_layers >= 3 (i.e. T > max_top_nodes * compression_rate).
+            next_sp = torch.empty_like(prev_sp)
+            htree_recompute_selection_kernel[grid_kv](
+                q, k_layer, prev_sp,
+                cos_cache, sin_cache,
+                next_sp,
+                layer_power=layer_power,
+                B=B, T=T, H=H, H_kv=H_kv,
+                NUM_GROUPS=NUM_GROUPS, K=K,
+                N_layer=N_layer,
+                COMPRESSION_RATE=compression_rate,
+                TOP_K=top_k_per_layer,
+                LOG_N=LOG_N, N_DIMS_TOPK=N_DIMS_TOPK,
+                SCORE_VALID_THRESHOLD=HTREE_SCORE_VALID_THRESHOLD,
+                NEG_INF=HTREE_SCORE_NEG_INF,
+                G_PAD=G_PAD, TILE_P=TILE_P,
+                scale=scale,
+            )
+            prev_sp = next_sp
+
+    return per_layer_parents
+
+
+# ============================================================
 #  Orchestration: htree_backward
 # ============================================================
 
@@ -1035,24 +1142,21 @@ class HTreeTritonFunction(torch.autograd.Function):
             scale=scale,
             rope_base=rope_base,
             _save_for_backward=True,
+            _save_parents=False,
         )
 
-        # Save tensors via PyTorch's mechanism
-        save_tensors = [q, output, bwd_ctx['global_max'], bwd_ctx['global_sum'],
-                        bwd_ctx['cos_cache'], bwd_ctx['sin_cache']]
-        for lk in bwd_ctx['layers_k']:
-            save_tensors.append(lk)
-        for lv in bwd_ctx['layers_v']:
-            save_tensors.append(lv)
-        for li in sorted(bwd_ctx['per_layer_parents'].keys()):
-            save_tensors.append(bwd_ctx['per_layer_parents'][li])
-        ctx.save_for_backward(*save_tensors)
+        ctx.save_for_backward(
+            q, k, v, output,
+            bwd_ctx['global_max'], bwd_ctx['global_sum'],
+            bwd_ctx['cos_cache'], bwd_ctx['sin_cache'],
+        )
 
         ctx.num_layers = bwd_ctx['num_layers']
         ctx.compression_rate = compression_rate
         ctx.top_k_per_layer = top_k_per_layer
         ctx.max_top_nodes = max_top_nodes
         ctx.scale = scale
+        ctx.rope_base = rope_base
         ctx.NUM_GROUPS = bwd_ctx['NUM_GROUPS']
         ctx.G_PAD = bwd_ctx['G_PAD']
         ctx.TILE_P = bwd_ctx['TILE_P']
@@ -1061,24 +1165,27 @@ class HTreeTritonFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dO):
-        saved = ctx.saved_tensors
-        num_layers = ctx.num_layers
-        NL = num_layers
+        q, k, v, output, global_max, global_sum, cos_cache, sin_cache = ctx.saved_tensors
 
-        q, output, global_max, global_sum, cos_cache, sin_cache = saved[:6]
-        idx = 6
-        layers_k = list(saved[idx:idx + NL]); idx += NL
-        layers_v = list(saved[idx:idx + NL]); idx += NL
-        per_layer_parents = {}
-        for li in range(NL):
-            per_layer_parents[li] = saved[idx]; idx += 1
+        with _cuda_timer("  Recompute tree build"):
+            layers_k, layers_v = _recompute_tree_build(
+                k, v, ctx.num_layers, ctx.compression_rate,
+            )
+
+        with _cuda_timer("  Recompute parents (selection-only)"):
+            per_layer_parents = _recompute_parents(
+                q, layers_k, cos_cache, sin_cache,
+                ctx.num_layers, ctx.compression_rate, ctx.top_k_per_layer,
+                ctx.max_top_nodes, ctx.scale,
+                ctx.NUM_GROUPS, ctx.G_PAD, ctx.TILE_P,
+            )
 
         bwd_ctx = dict(
             global_max=global_max, global_sum=global_sum,
             per_layer_parents=per_layer_parents,
             layers_k=layers_k, layers_v=layers_v,
             cos_cache=cos_cache, sin_cache=sin_cache,
-            num_layers=NL,
+            num_layers=ctx.num_layers,
             compression_rate=ctx.compression_rate,
             top_k_per_layer=ctx.top_k_per_layer,
             max_top_nodes=ctx.max_top_nodes,
@@ -1090,7 +1197,7 @@ class HTreeTritonFunction(torch.autograd.Function):
         )
 
         dq, dk, dv = htree_backward(dO, q, output, bwd_ctx)
-        return dq.to(q.dtype), dk.to(layers_k[0].dtype), dv.to(layers_v[0].dtype), None, None, None, None, None
+        return dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None, None
 
 
 def htree_forward_triton_autograd(

@@ -881,6 +881,7 @@ def htree_forward(
     scale: Optional[float] = None,
     rope_base: float = 10000.0,
     _save_for_backward: bool = False,
+    _save_parents: bool = True,
 ) -> torch.Tensor:
     """
     htree Forward
@@ -1035,10 +1036,11 @@ def htree_forward(
     prev_selected_parents = torch.where(valid_mask, parent_candidates, torch.tensor(-1, dtype=torch.int32, device=device))
     prev_selected_parents = prev_selected_parents.unsqueeze(0).unsqueeze(2).expand(B, T, H_kv, top_k_per_layer).contiguous()
     next_selected_parents = torch.empty_like(prev_selected_parents)
-    per_layer_parents = {} if _save_for_backward else None
+    _do_save_parents = _save_for_backward and _save_parents
+    per_layer_parents = {} if _do_save_parents else None
     
     for layer_idx in range(num_layers - 1, -1, -1):
-        if _save_for_backward:
+        if _do_save_parents:
             per_layer_parents[layer_idx] = prev_selected_parents.clone()
         nvtx.range_push(f"Forward_Layer_{layer_idx}")
         k_layer = layers_k[layer_idx]
@@ -1157,11 +1159,254 @@ def htree_forward(
     return output
 
 
+
+# ========================================
+#  Selection-Only Kernel (for backward recompute)
+# ========================================
+
+@triton.jit
+def htree_recompute_selection_kernel(
+    q,                        # [B, T, H, K]
+    layer_k,                  # [B, N_layer, H_kv, K]
+    prev_selected_parents,    # [B, T, H_kv, TOP_K]
+    cos_cache, sin_cache,     # [cache_size, K//2]
+    next_selected_parents,    # [B, T, H_kv, TOP_K]  (output, sorted asc, -1 padded)
+    layer_power: tl.constexpr,
+    B: tl.constexpr,
+    T,
+    H: tl.constexpr,
+    H_kv: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    K: tl.constexpr,
+    N_layer: tl.constexpr,
+    COMPRESSION_RATE: tl.constexpr,
+    TOP_K: tl.constexpr,
+    LOG_N: tl.constexpr,
+    N_DIMS_TOPK: tl.constexpr,
+    SCORE_VALID_THRESHOLD: tl.constexpr,
+    NEG_INF: tl.constexpr,
+    G_PAD: tl.constexpr,
+    TILE_P: tl.constexpr,
+    scale,
+):
+    """Selection-only variant of htree_select_accumulate_gqa_kernel.
+
+    Reproduces the same Top-K selection without V loads or PV accumulation.
+    Used by backward to recompute per_layer_parents without storing them
+    across the forward→backward gap.
+
+    Grid: (T, B*H_kv).
+    """
+    i_t = tl.program_id(0)
+    pid_bh_kv = tl.program_id(1)
+    i_b = pid_bh_kv // H_kv
+    i_h_kv = pid_bh_kv % H_kv
+
+    rightmost_idx = i_t // layer_power
+    rightmost_parent_idx = rightmost_idx // COMPRESSION_RATE
+    rightmost_child_idx = rightmost_idx % COMPRESSION_RATE
+
+    T_i64 = T.to(tl.int64)
+
+    prev_sel_base = (
+        i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
+        + i_t.to(tl.int64) * H_kv * TOP_K
+        + i_h_kv.to(tl.int64) * TOP_K
+    )
+    parent_list = tl.load(prev_selected_parents + prev_sel_base + tl.arange(0, TOP_K))
+    num_valid_parents = tl.sum((parent_list >= 0).to(tl.int32))
+
+    assert num_valid_parents > 0, "No valid candidates found"
+
+    num_candidates = ((num_valid_parents - 1) * COMPRESSION_RATE + rightmost_child_idx + 1).to(tl.int32)
+    rope_pos_q = num_candidates - 1
+
+    g_ids = tl.arange(0, G_PAD).to(tl.int64)
+    g_valid = g_ids < NUM_GROUPS
+    head_ids = (i_h_kv.to(tl.int64) * NUM_GROUPS + g_ids) * g_valid.to(tl.int64)
+
+    o_k_half = tl.arange(0, K // 2).to(tl.int64)
+    q_bt_base = i_b.to(tl.int64) * T_i64 * H * K + i_t.to(tl.int64) * H * K
+    q_ptrs = q + q_bt_base + head_ids[:, None] * K
+    q_lo = tl.load(q_ptrs + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+    q_hi = tl.load(q_ptrs + (K // 2) + o_k_half[None, :], mask=g_valid[:, None], other=0.0)
+
+    cos_q = tl.load(cos_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    sin_q = tl.load(sin_cache + rope_pos_q.to(tl.int64) * (K // 2) + o_k_half)
+    q_rope_lo = (q_lo * cos_q[None, :] - q_hi * sin_q[None, :]) * scale
+    q_rope_hi = (q_lo * sin_q[None, :] + q_hi * cos_q[None, :]) * scale
+
+    PARENTS_PER_BATCH: tl.constexpr = TOP_K // COMPRESSION_RATE
+    BC: tl.constexpr = PARENTS_PER_BATCH * COMPRESSION_RATE
+    num_batches = (num_valid_parents + (PARENTS_PER_BATCH - 1)) // PARENTS_PER_BATCH
+
+    idx_mask = (1 << LOG_N) - 1
+    rightmost_pos = (num_candidates - 1).to(tl.int32)
+    topk_running_max = tl.full([1], NEG_INF, dtype=tl.float32)
+
+    init_idx = tl.arange(0, TOP_K).to(tl.int32)
+    init_imp = tl.full([TOP_K], NEG_INF, dtype=tl.float32)
+    init_int = init_imp.to(tl.int32, bitcast=True)
+    init_encoded = (init_int & ~idx_mask) | (init_idx & idx_mask)
+    running_topk_encoded = init_encoded.to(tl.float32, bitcast=True)
+
+    k_base = layer_k + i_b.to(tl.int64) * N_layer * H_kv * K + i_h_kv.to(tl.int64) * K
+
+    TILE_N: tl.constexpr = TILE_P * COMPRESSION_RATE
+    PARENT_TILES: tl.constexpr = (PARENTS_PER_BATCH + TILE_P - 1) // TILE_P
+    o_n = tl.arange(0, TILE_N).to(tl.int32)
+    parent_in_tile = o_n // COMPRESSION_RATE
+    child_in_tile = o_n % COMPRESSION_RATE
+    batch_rows = tl.arange(0, PARENTS_PER_BATCH).to(tl.int32)
+    tile_rows = tl.arange(0, TILE_P).to(tl.int32)
+    row_idx = tl.arange(0, 2)[:, None]
+
+    for i_batch in range(num_batches):
+        # ---- Phase 1: score computation + importance ----
+        importance_matrix = tl.full([PARENTS_PER_BATCH, COMPRESSION_RATE], NEG_INF, dtype=tl.float32)
+        batch_m = tl.full([1], NEG_INF, dtype=tl.float32)
+        batch_parent_base = (i_batch * PARENTS_PER_BATCH).to(tl.int32)
+
+        for i_tile in range(PARENT_TILES):
+            tile_base = (i_tile * TILE_P).to(tl.int32)
+            parent_off_local = tile_base + parent_in_tile
+            parent_off = batch_parent_base + parent_off_local
+
+            safe_poff = tl.minimum(tl.maximum(parent_off, 0), TOP_K - 1).to(tl.int64)
+            parent_idx = tl.load(
+                prev_selected_parents + prev_sel_base + safe_poff
+            ).to(tl.int32)
+
+            poff_valid = (
+                (parent_off_local < PARENTS_PER_BATCH)
+                & (parent_off < num_valid_parents)
+                & (parent_off < TOP_K)
+                & (parent_idx >= 0)
+            )
+            is_rm = parent_idx == rightmost_parent_idx
+            ch_ok = ~is_rm | (child_in_tile <= rightmost_child_idx)
+            child_rows = tl.maximum(parent_idx, 0) * COMPRESSION_RATE + child_in_tile
+            child_valid = poff_valid & ch_ok & (child_rows >= 0) & (child_rows < N_layer)
+
+            safe_child_rows = tl.minimum(tl.maximum(child_rows, 0), N_layer - 1).to(tl.int64)
+            k_row = k_base + safe_child_rows[:, None] * (H_kv * K)
+            k_lo = tl.load(k_row + o_k_half[None, :]).to(tl.float32)
+            k_hi = tl.load(k_row + (K // 2) + o_k_half[None, :]).to(tl.float32)
+
+            rope_pos = parent_off.to(tl.int64) * COMPRESSION_RATE + child_in_tile.to(tl.int64)
+            rope_pos = tl.maximum(rope_pos, 0)
+            cos_k = tl.load(cos_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+            sin_k = tl.load(sin_cache + rope_pos[:, None] * (K // 2) + o_k_half[None, :])
+            k_rope_lo = k_lo * cos_k - k_hi * sin_k
+            k_rope_hi = k_lo * sin_k + k_hi * cos_k
+
+            scores = tl.dot(q_rope_lo, tl.trans(k_rope_lo)) + tl.dot(q_rope_hi, tl.trans(k_rope_hi))
+            scores = tl.where(child_valid[None, :] & g_valid[:, None], scores, NEG_INF)
+
+            local_m = tl.max(scores)
+            new_batch_m = tl.maximum(batch_m, local_m)
+            rescale_batch_old = tl.exp(batch_m - new_batch_m)
+            importance_matrix = tl.where(importance_matrix >= 0, importance_matrix * rescale_batch_old, importance_matrix)
+            batch_m = new_batch_m
+
+            attn_probs = tl.exp(scores - batch_m)
+            attn_probs = tl.where(child_valid[None, :] & g_valid[:, None], attn_probs, 0.0)
+            importance_tile = tl.sum(attn_probs, axis=0)
+            importance_tile = tl.where(child_valid, importance_tile, NEG_INF)
+            importance_tile_2d = tl.reshape(importance_tile, [TILE_P, COMPRESSION_RATE])
+
+            for i_r in tl.static_range(TILE_P):
+                row_off = (tile_base + i_r).to(tl.int32)
+                row_mask_in_tile = (tile_rows == i_r)[:, None]
+                row_vals = tl.sum(tl.where(row_mask_in_tile, importance_tile_2d, 0.0), axis=0)
+                row_vals = tl.where(row_off < PARENTS_PER_BATCH, row_vals, NEG_INF)
+                is_row = (batch_rows == row_off)[:, None]
+                importance_matrix = tl.where(is_row, row_vals[None, :], importance_matrix)
+
+        # ---- Phase 2: Top-K merge sort ----
+        importance_flat = tl.reshape(importance_matrix, [BC])
+        buf_off = (i_batch * BC).to(tl.int32)
+        pos = buf_off + tl.arange(0, BC).to(tl.int32)
+        valid_pos = pos < num_candidates
+        importance_flat = tl.where(valid_pos, importance_flat, NEG_INF)
+
+        sel_m_new = tl.maximum(topk_running_max, batch_m)
+        rescale_run = tl.exp(topk_running_max - sel_m_new)
+        rescale_batch = tl.exp(batch_m - sel_m_new)
+
+        run_int = running_topk_encoded.to(tl.int32, bitcast=True)
+        run_raw_idx = run_int & idx_mask
+        run_clean_int = run_int & ~idx_mask
+        run_clean_imp = run_clean_int.to(tl.float32, bitcast=True)
+        run_rescaled_imp = tl.where(run_clean_imp >= 0, run_clean_imp * rescale_run, run_clean_imp)
+        run_rescaled_int = run_rescaled_imp.to(tl.int32, bitcast=True)
+        run_rescaled_encoded = (run_rescaled_int & ~idx_mask) | run_raw_idx
+        running_topk_encoded = run_rescaled_encoded.to(tl.float32, bitcast=True)
+
+        importance_flat = tl.where(importance_flat >= 0, importance_flat * rescale_batch, importance_flat)
+        importance_flat = tl.where(pos == rightmost_pos, 1e6, importance_flat)
+        topk_running_max = sel_m_new
+
+        importance_int = importance_flat.to(tl.int32, bitcast=True)
+        encoded_idx = tl.where(importance_flat >= 0, ~pos, pos) & idx_mask
+        encoded_int = (importance_int & ~idx_mask) | encoded_idx
+        batch_encoded = encoded_int.to(tl.float32, bitcast=True)
+
+        running_b = tl.broadcast_to(running_topk_encoded[None, :], [2, TOP_K])
+        batch_b = tl.broadcast_to(batch_encoded[None, :], [2, TOP_K])
+        merged_2d = tl.where(row_idx == 0, running_b, batch_b)
+        merged_input = tl.reshape(merged_2d, [2 * TOP_K])
+
+        N_DIMS_MERGE: tl.constexpr = N_DIMS_TOPK + 1
+        sorted_merged = tl.sort(merged_input, descending=True)
+        merged_sorted_2d = tl.reshape(sorted_merged, [2, TOP_K])
+
+        running_topk_encoded = tl.sum(tl.where(row_idx == 0, merged_sorted_2d, 0.0), axis=0)
+
+    # ---- Decode final Top-K → next_selected_parents ----
+    topk_int = running_topk_encoded.to(tl.int32, bitcast=True)
+    raw_idx = topk_int & idx_mask
+    clean_int = topk_int & ~idx_mask
+    clean_imp = clean_int.to(tl.float32, bitcast=True)
+    topk_pos = tl.where(clean_imp >= 0, ~raw_idx, raw_idx)
+    topk_pos = (topk_pos & idx_mask).to(tl.int32)
+    topk_valid = (clean_imp > SCORE_VALID_THRESHOLD) & (topk_pos < num_candidates)
+    topk_pos = tl.where(topk_valid, topk_pos, -1).to(tl.int32)
+
+    parent_off_f = tl.where(topk_pos >= 0, topk_pos // COMPRESSION_RATE, 0).to(tl.int32)
+    child_slot_f = tl.where(topk_pos >= 0, topk_pos - parent_off_f * COMPRESSION_RATE, 0).to(tl.int32)
+    parent_idx_f = tl.load(
+        prev_selected_parents + prev_sel_base + parent_off_f.to(tl.int64),
+        mask=topk_pos >= 0,
+        other=-1,
+    ).to(tl.int32)
+    selected_node_indices = tl.where(
+        topk_pos >= 0,
+        parent_idx_f * COMPRESSION_RATE + child_slot_f,
+        -1,
+    ).to(tl.int32)
+
+    MAX_IDX: tl.constexpr = 2147483647
+    selected_sorted = tl.where(selected_node_indices >= 0, selected_node_indices, MAX_IDX)
+    selected_sorted = tl.sort(selected_sorted, descending=False)
+    selected_sorted = tl.where(selected_sorted < MAX_IDX, selected_sorted, -1)
+
+    out_par_base = (
+        i_b.to(tl.int64) * T_i64 * H_kv * TOP_K
+        + i_t.to(tl.int64) * H_kv * TOP_K
+        + i_h_kv.to(tl.int64) * TOP_K
+    )
+    tl.store(next_selected_parents + out_par_base + tl.arange(0, TOP_K), selected_sorted.to(tl.int32))
+
+
 __all__ = [
     'htree_forward',
     'htree_build_kernel',
     'htree_bottom_accumulate_gqa_kernel',
     'htree_select_accumulate_gqa_kernel',
+    'htree_recompute_selection_kernel',
     'htree_merge_to_global_kernel',
     'htree_final_normalize_kernel',
+    'HTREE_SCORE_NEG_INF',
+    'HTREE_SCORE_VALID_THRESHOLD',
 ]
