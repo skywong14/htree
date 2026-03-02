@@ -905,7 +905,7 @@ def _recompute_parents(q, layers_k, cos_cache, sin_cache,
 
     per_layer_parents = {}
     for layer_idx in range(num_layers - 1, -1, -1):
-        per_layer_parents[layer_idx] = prev_sp
+        per_layer_parents[layer_idx] = prev_sp.clone()
 
         if layer_idx > 0:
             k_layer = layers_k[layer_idx]
@@ -913,13 +913,6 @@ def _recompute_parents(q, layers_k, cos_cache, sin_cache,
             layer_power = compression_rate ** layer_idx
             grid_kv = (T, B * H_kv)
 
-            # Allocate a fresh output buffer each iteration so that the tensor
-            # already stored in per_layer_parents[layer_idx] (= current prev_sp)
-            # is never overwritten by a later selection kernel.  Reusing next_sp
-            # via a swap would alias per_layer_parents[num_layers-1] with the
-            # buffer written in the next pass, corrupting the stored parents when
-            # num_layers >= 3 (i.e. T > max_top_nodes * compression_rate).
-            next_sp = torch.empty_like(prev_sp)
             htree_recompute_selection_kernel[grid_kv](
                 q, k_layer, prev_sp,
                 cos_cache, sin_cache,
@@ -936,7 +929,7 @@ def _recompute_parents(q, layers_k, cos_cache, sin_cache,
                 G_PAD=G_PAD, TILE_P=TILE_P,
                 scale=scale,
             )
-            prev_sp = next_sp
+            prev_sp, next_sp = next_sp, prev_sp  # swap to reuse buffers
 
     return per_layer_parents
 
